@@ -662,24 +662,73 @@ async function replyToComment(accessToken, commentId, replyText) {
 // Send a direct message
 async function sendDirectMessage(accessToken, instagramAccountId, recipientUsername, message) {
   try {
-    // First, we need to get the user ID from the username
-    const userSearchResponse = await fetch(
-      `https://graph.facebook.com/v18.0/ig_username_search?q=${recipientUsername}&access_token=${accessToken}`,
-      { cache: "no-store" },
-    )
+    let recipientId = null
 
-    if (!userSearchResponse.ok) {
-      const errorData = await userSearchResponse.json()
-      throw new Error(`Failed to find Instagram user: ${JSON.stringify(errorData)}`)
+    // Try multiple approaches to get the user ID
+    try {
+      // First try the username search endpoint
+      const userSearchResponse = await fetch(
+        `https://graph.facebook.com/v18.0/ig_username_search?q=${recipientUsername}&access_token=${accessToken}`,
+        { cache: "no-store" },
+      )
+
+      if (userSearchResponse.ok) {
+        const userSearchData = await userSearchResponse.json()
+        if (userSearchData.data && userSearchData.data.length > 0) {
+          recipientId = userSearchData.data[0].id
+        }
+      } else {
+        console.log(`Username search failed for ${recipientUsername}, trying alternative method`)
+      }
+    } catch (searchError) {
+      console.error(`Error searching for username ${recipientUsername}:`, searchError)
     }
 
-    const userSearchData = await userSearchResponse.json()
+    // If username search failed, try business discovery
+    if (!recipientId) {
+      try {
+        const businessDiscoveryResponse = await fetch(
+          `https://graph.facebook.com/v18.0/${instagramAccountId}?fields=business_discovery.username(${recipientUsername})&access_token=${accessToken}`,
+          { cache: "no-store" },
+        )
 
-    if (!userSearchData.data || userSearchData.data.length === 0) {
-      throw new Error(`Instagram user @${recipientUsername} not found`)
+        if (businessDiscoveryResponse.ok) {
+          const businessData = await businessDiscoveryResponse.json()
+          if (businessData.business_discovery && businessData.business_discovery.id) {
+            recipientId = businessData.business_discovery.id
+          }
+        }
+      } catch (businessError) {
+        console.error(`Error using business discovery for ${recipientUsername}:`, businessError)
+      }
     }
 
-    const recipientId = userSearchData.data[0].id
+    // If we still don't have a recipient ID, try one more approach
+    if (!recipientId) {
+      try {
+        // Try to get user info from mentions
+        const mentionsResponse = await fetch(
+          `https://graph.facebook.com/v18.0/${instagramAccountId}/mentions?access_token=${accessToken}`,
+          { cache: "no-store" },
+        )
+
+        if (mentionsResponse.ok) {
+          const mentionsData = await mentionsResponse.json()
+          const mention = mentionsData.data?.find((m) => m.username?.toLowerCase() === recipientUsername.toLowerCase())
+
+          if (mention && mention.id) {
+            recipientId = mention.id
+          }
+        }
+      } catch (mentionsError) {
+        console.error(`Error with mentions approach for ${recipientUsername}:`, mentionsError)
+      }
+    }
+
+    // If we still don't have a recipient ID, throw an error
+    if (!recipientId) {
+      throw new Error(`Could not find Instagram user ID for @${recipientUsername}`)
+    }
 
     // Now send the DM using the Instagram Graph API
     const dmResponse = await fetch(`https://graph.facebook.com/v18.0/${instagramAccountId}/messages`, {
@@ -717,24 +766,73 @@ async function sendDirectMessageWithButton(
   automationId,
 ) {
   try {
-    // First, we need to get the user ID from the username
-    const userSearchResponse = await fetch(
-      `https://graph.facebook.com/v18.0/ig_username_search?q=${recipientUsername}&access_token=${accessToken}`,
-      { cache: "no-store" },
-    )
+    let recipientId = null
 
-    if (!userSearchResponse.ok) {
-      const errorData = await userSearchResponse.json()
-      throw new Error(`Failed to find Instagram user: ${JSON.stringify(errorData)}`)
+    // Try multiple approaches to get the user ID
+    try {
+      // First try the username search endpoint
+      const userSearchResponse = await fetch(
+        `https://graph.facebook.com/v18.0/ig_username_search?q=${recipientUsername}&access_token=${accessToken}`,
+        { cache: "no-store" },
+      )
+
+      if (userSearchResponse.ok) {
+        const userSearchData = await userSearchResponse.json()
+        if (userSearchData.data && userSearchData.data.length > 0) {
+          recipientId = userSearchData.data[0].id
+        }
+      } else {
+        console.log(`Username search failed for ${recipientUsername}, trying alternative method`)
+      }
+    } catch (searchError) {
+      console.error(`Error searching for username ${recipientUsername}:`, searchError)
     }
 
-    const userSearchData = await userSearchResponse.json()
+    // If username search failed, try business discovery
+    if (!recipientId) {
+      try {
+        const businessDiscoveryResponse = await fetch(
+          `https://graph.facebook.com/v18.0/${instagramAccountId}?fields=business_discovery.username(${recipientUsername})&access_token=${accessToken}`,
+          { cache: "no-store" },
+        )
 
-    if (!userSearchData.data || userSearchData.data.length === 0) {
-      throw new Error(`Instagram user @${recipientUsername} not found`)
+        if (businessDiscoveryResponse.ok) {
+          const businessData = await businessDiscoveryResponse.json()
+          if (businessData.business_discovery && businessData.business_discovery.id) {
+            recipientId = businessData.business_discovery.id
+          }
+        }
+      } catch (businessError) {
+        console.error(`Error using business discovery for ${recipientUsername}:`, businessError)
+      }
     }
 
-    const recipientId = userSearchData.data[0].id
+    // If we still don't have a recipient ID, try one more approach
+    if (!recipientId) {
+      try {
+        // Try to get user info from mentions
+        const mentionsResponse = await fetch(
+          `https://graph.facebook.com/v18.0/${instagramAccountId}/mentions?access_token=${accessToken}`,
+          { cache: "no-store" },
+        )
+
+        if (mentionsResponse.ok) {
+          const mentionsData = await mentionsResponse.json()
+          const mention = mentionsData.data?.find((m) => m.username?.toLowerCase() === recipientUsername.toLowerCase())
+
+          if (mention && mention.id) {
+            recipientId = mention.id
+          }
+        }
+      } catch (mentionsError) {
+        console.error(`Error with mentions approach for ${recipientUsername}:`, mentionsError)
+      }
+    }
+
+    // If we still don't have a recipient ID, throw an error
+    if (!recipientId) {
+      throw new Error(`Could not find Instagram user ID for @${recipientUsername}`)
+    }
 
     // Now send the DM with button using the Instagram Graph API
     const dmResponse = await fetch(`https://graph.facebook.com/v18.0/${instagramAccountId}/messages`, {
