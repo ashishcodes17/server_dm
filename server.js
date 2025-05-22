@@ -359,20 +359,39 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
           const buttonText = automation.buttonText || "Send me the link"
 
           try {
-            await sendDirectMessageWithButton(
-              validToken,
-              instagramAccount.instagramId,
-              comment.from?.username || "unknown",
-              openingMessage,
-              buttonText,
-              automation._id,
-            )
+            // Use Facebook Graph API to send message with button
+            const response = await fetch(`https://graph.facebook.com/v18.0/${instagramAccount.instagramId}/messages`, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                recipient: { id: comment.from.id },
+                message: {
+                  text: openingMessage,
+                  quick_replies: [
+                    {
+                      content_type: "text",
+                      title: buttonText,
+                      payload: `SEND_CONTENT_${automation._id}`,
+                    },
+                  ],
+                },
+                access_token: validToken,
+              }),
+            })
+
+            if (!response.ok) {
+              const errorData = await response.json()
+              throw new Error(`Failed to send message with button: ${JSON.stringify(errorData)}`)
+            }
 
             // Log the sent opening DM
             await db.collection("directMessages").insertOne({
               _id: new ObjectId().toString(),
               automationId: automation._id,
               recipientUsername: comment.from?.username || "unknown",
+              recipientId: comment.from.id,
               commentId: comment.id,
               message: openingMessage,
               type: "opening",
@@ -392,25 +411,41 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
                 fullMessage += `\n\n${automation.brandingMessage || "⚡ Sent via ChatAutoDM — grow your DMs on autopilot"}`
               }
 
-              messageResult = await sendDirectMessageWithFallback(
-                validToken,
-                instagramAccount.instagramId,
-                comment.from?.username || "unknown",
-                fullMessage,
-                comment.id,
+              // Use Facebook Graph API to send regular message
+              const response = await fetch(
+                `https://graph.facebook.com/v18.0/${instagramAccount.instagramId}/messages`,
+                {
+                  method: "POST",
+                  headers: {
+                    "Content-Type": "application/json",
+                  },
+                  body: JSON.stringify({
+                    recipient: { id: comment.from.id },
+                    message: { text: fullMessage },
+                    access_token: validToken,
+                  }),
+                },
               )
+
+              if (!response.ok) {
+                const errorData = await response.json()
+                throw new Error(`Failed to send fallback message: ${JSON.stringify(errorData)}`)
+              }
 
               // Log the sent message
               await db.collection("directMessages").insertOne({
                 _id: new ObjectId().toString(),
                 automationId: automation._id,
                 recipientUsername: comment.from?.username || "unknown",
+                recipientId: comment.from.id,
                 commentId: comment.id,
                 message: fullMessage,
-                type: messageResult.method === "dm" ? "direct" : "comment_fallback",
+                type: "direct",
                 status: "sent",
                 sentAt: new Date(),
               })
+
+              messageResult = { success: true, method: "dm" }
             } catch (fallbackError) {
               throw fallbackError
             }
@@ -423,25 +458,38 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
             fullMessage += `\n\n${automation.brandingMessage || "⚡ Sent via ChatAutoDM — grow your DMs on autopilot"}`
           }
 
-          messageResult = await sendDirectMessageWithFallback(
-            validToken,
-            instagramAccount.instagramId,
-            comment.from?.username || "unknown",
-            fullMessage,
-            comment.id,
-          )
+          // Use Facebook Graph API to send message
+          const response = await fetch(`https://graph.facebook.com/v18.0/${instagramAccount.instagramId}/messages`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              recipient: { id: comment.from.id },
+              message: { text: fullMessage },
+              access_token: validToken,
+            }),
+          })
+
+          if (!response.ok) {
+            const errorData = await response.json()
+            throw new Error(`Failed to send direct message: ${JSON.stringify(errorData)}`)
+          }
 
           // Log the sent message
           await db.collection("directMessages").insertOne({
             _id: new ObjectId().toString(),
             automationId: automation._id,
             recipientUsername: comment.from?.username || "unknown",
+            recipientId: comment.from.id,
             commentId: comment.id,
             message: fullMessage,
-            type: messageResult.method === "dm" ? "direct" : "comment_fallback",
+            type: "direct",
             status: "sent",
             sentAt: new Date(),
           })
+
+          messageResult = { success: true, method: "dm" }
         }
 
         messagesSent++
@@ -466,6 +514,7 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
           _id: new ObjectId().toString(),
           automationId: automation._id,
           recipientUsername: comment.from?.username || "unknown",
+          recipientId: comment.from.id,
           commentId: comment.id,
           message: automation.useOpeningMessage ? automation.openingMessage : automation.message,
           status: "failed",
@@ -551,7 +600,7 @@ async function processButtonClick(data) {
       console.error("Error getting username:", error)
     }
 
-    // Send the DM
+    // Send the DM using Facebook Graph API
     const dmResponse = await fetch(`https://graph.facebook.com/v18.0/${instagramAccount.instagramId}/messages`, {
       method: "POST",
       headers: {
@@ -708,6 +757,17 @@ async function processMessage(messageData) {
       console.log(`Updated existing contact: ${contact.username} with new message`)
     }
 
+    // Add message to chat history
+    await db.collection("messages").insertOne({
+      _id: messageId,
+      contactId: contact._id,
+      instagramAccountId: instagramAccount._id,
+      fromMe: false,
+      message: message?.text || "",
+      timestamp: new Date(),
+      read: false,
+    })
+
     // Check for automated responses based on message content
     const automations = await db
       .collection("automations")
@@ -770,7 +830,7 @@ async function processMessage(messageData) {
 
           for (let attempt = 1; attempt <= 3; attempt++) {
             try {
-              // Send the DM directly using the Graph API
+              // Send the DM directly using the Facebook Graph API
               const token = instagramAccount.pageAccessToken || instagramAccount.accessToken
               const dmResponse = await fetch(
                 `https://graph.facebook.com/v18.0/${instagramAccount.instagramId}/messages`,
@@ -809,8 +869,9 @@ async function processMessage(messageData) {
           // Log the result
           if (success) {
             // Log the sent response
+            const autoMessageId = new ObjectId().toString()
             await db.collection("directMessages").insertOne({
-              _id: new ObjectId().toString(),
+              _id: autoMessageId,
               automationId: automation._id,
               userId: instagramAccount.userId,
               instagramAccountId: instagramAccount._id,
@@ -824,6 +885,7 @@ async function processMessage(messageData) {
 
             // Add to messages collection for UI display
             await db.collection("messages").insertOne({
+              _id: autoMessageId,
               contactId: contact._id,
               instagramAccountId: instagramAccount._id,
               fromMe: true,
@@ -1663,11 +1725,71 @@ async function subscribeToWebhooks(pageId, pageAccessToken) {
 
 // Schedule jobs
 function scheduleJobs() {
-  // Check for comments every 5 minutes
-  setInterval(checkForComments, 1 * 60 * 1000)
+  // Check for pending messages every minute
+  setInterval(async () => {
+    try {
+      const pendingMessages = await db
+        .collection("incomingMessages")
+        .find({ processed: false })
+        .sort({ createdAt: 1 })
+        .limit(20)
+        .toArray()
 
-  // Refresh tokens every 24 hours
-  setInterval(refreshTokens, 24 * 60 * 60 * 1000)
+      console.log(`Processing ${pendingMessages.length} pending messages`)
+
+      for (const message of pendingMessages) {
+        try {
+          await processMessage({
+            sender: { id: message.senderId, username: message.senderUsername },
+            recipient: { id: message.recipientId },
+            message: { text: message.message },
+            timestamp: message.timestamp,
+          })
+        } catch (error) {
+          console.error(`Error processing pending message ${message._id}:`, error)
+        }
+      }
+    } catch (error) {
+      console.error("Error in pending messages job:", error)
+    }
+  }, 60 * 1000)
+
+  // Check for pending comments every minute
+  setInterval(async () => {
+    try {
+      const pendingComments = await db
+        .collection("pendingComments")
+        .find({ processed: false })
+        .sort({ createdAt: 1 })
+        .limit(20)
+        .toArray()
+
+      console.log(`Processing ${pendingComments.length} pending comments`)
+
+      for (const comment of pendingComments) {
+        try {
+          await processComment({
+            id: comment.commentId,
+            text: comment.text,
+            media_id: comment.mediaId,
+            from: {
+              id: comment.userId,
+              username: comment.username,
+            },
+          })
+
+          // Mark as processed
+          await db
+            .collection("pendingComments")
+            .updateOne({ _id: comment._id }, { $set: { processed: true, processedAt: new Date() } })
+        } catch (error) {
+          console.error(`Error processing pending comment ${comment._id}:`, error)
+        }
+      }
+    } catch (error) {
+      console.error("Error in pending comments job:", error)
+    }
+  }, 60 * 1000)
 
   console.log("Scheduled jobs initialized")
 }
@@ -1679,10 +1801,6 @@ async function startServer() {
 
     // Schedule jobs
     scheduleJobs()
-
-    // Run initial jobs
-    setTimeout(refreshTokens, 5000)
-    setTimeout(checkForComments, 10000)
 
     app.listen(PORT, () => {
       console.log(`Server running on port ${PORT}`)
