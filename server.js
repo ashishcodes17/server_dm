@@ -13,21 +13,29 @@ const PORT = process.env.PORT || 3001
 app.use(cors())
 app.use(bodyParser.json({ limit: "10mb" }))
 
-// MongoDB connection
+// MongoDB connection with improved options
 const MONGODB_URI = process.env.MONGODB_URI
 let client
 let db
 
-// Connect to MongoDB
+// Connect to MongoDB with improved options
 async function connectToMongoDB() {
   try {
-    client = new MongoClient(MONGODB_URI)
+    client = new MongoClient(MONGODB_URI, {
+      connectTimeoutMS: 30000,
+      socketTimeoutMS: 45000,
+      serverSelectionTimeoutMS: 60000,
+      maxPoolSize: 10,
+      minPoolSize: 5,
+      maxIdleTimeMS: 120000,
+    })
     await client.connect()
     db = client.db("instaautodm")
     console.log("Connected to MongoDB")
   } catch (error) {
     console.error("Error connecting to MongoDB:", error)
-    process.exit(1)
+    // Attempt to reconnect after a delay
+    setTimeout(connectToMongoDB, 5000)
   }
 }
 
@@ -158,6 +166,12 @@ async function findOrCreatePost(mediaId) {
 
     for (const account of accounts) {
       try {
+        // Validate token before using
+        if (!account.accessToken || account.accessToken.includes("undefined") || account.accessToken.includes("null")) {
+          console.log(`Invalid token format for account ${account.username}, skipping`)
+          continue
+        }
+
         // Try to fetch the post details using the account's token
         const token = account.pageAccessToken || account.accessToken
         if (!token) continue
@@ -210,9 +224,9 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
         commentId: comment.id,
         mediaId: comment.media_id,
         postId: post._id,
-        text: comment.text,
-        username: comment.from.username,
-        userId: comment.from.id,
+        text: comment.text || "",
+        username: comment.from?.username || "unknown",
+        userId: comment.from?.id || "unknown",
         createdAt: new Date(),
         processed: false,
       })
@@ -257,23 +271,23 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
       // Check if the comment contains the trigger keyword
       const triggerMatched =
         automation.triggerKeyword === "any" ||
-        comment.text.toLowerCase().includes(automation.triggerKeyword.toLowerCase())
+        (comment.text && comment.text.toLowerCase().includes(automation.triggerKeyword.toLowerCase()))
 
       if (!triggerMatched) {
         console.log(`Trigger "${automation.triggerKeyword}" not matched in comment: ${comment.text}`)
         continue
       }
 
-      console.log(`Trigger "${automation.triggerKeyword}" matched in comment from ${comment.from.username}`)
+      console.log(`Trigger "${automation.triggerKeyword}" matched in comment from ${comment.from?.username}`)
 
       // Check if we've already sent a DM to this user for this automation
       const existingDM = await db.collection("directMessages").findOne({
         automationId: automation._id,
-        recipientUsername: comment.from.username,
+        recipientUsername: comment.from?.username,
       })
 
       if (existingDM) {
-        console.log(`Already sent a DM to ${comment.from.username} for automation ${automation._id}`)
+        console.log(`Already sent a DM to ${comment.from?.username} for automation ${automation._id}`)
         continue
       }
 
@@ -289,6 +303,16 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
 
       if (recentDMs >= (automation.rateLimit || 10)) {
         console.log(`Rate limit reached for automation ${automation._id}`)
+        continue
+      }
+
+      // Validate token before using
+      if (
+        !instagramAccount.accessToken ||
+        instagramAccount.accessToken.includes("undefined") ||
+        instagramAccount.accessToken.includes("null")
+      ) {
+        console.log(`Invalid token format for account ${instagramAccount.username}, skipping automation`)
         continue
       }
 
@@ -312,8 +336,8 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
             _id: new ObjectId().toString(),
             automationId: automation._id,
             commentId: comment.id,
-            username: comment.from.username,
-            reply: automation.commentReply,
+            username: comment.from?.username || "unknown",
+            reply: automation.commentReply || "Thanks! Please check your DMs.",
             status: "sent",
             sentAt: new Date(),
           })
@@ -338,7 +362,7 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
             await sendDirectMessageWithButton(
               validToken,
               instagramAccount.instagramId,
-              comment.from.username,
+              comment.from?.username || "unknown",
               openingMessage,
               buttonText,
               automation._id,
@@ -348,7 +372,7 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
             await db.collection("directMessages").insertOne({
               _id: new ObjectId().toString(),
               automationId: automation._id,
-              recipientUsername: comment.from.username,
+              recipientUsername: comment.from?.username || "unknown",
               commentId: comment.id,
               message: openingMessage,
               type: "opening",
@@ -358,7 +382,7 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
 
             messageResult = { success: true, method: "dm_button" }
           } catch (buttonError) {
-            console.error(`Error sending DM with button to ${comment.from.username}:`, buttonError)
+            console.error(`Error sending DM with button to ${comment.from?.username}:`, buttonError)
 
             // Try fallback to regular DM with fallback
             try {
@@ -371,7 +395,7 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
               messageResult = await sendDirectMessageWithFallback(
                 validToken,
                 instagramAccount.instagramId,
-                comment.from.username,
+                comment.from?.username || "unknown",
                 fullMessage,
                 comment.id,
               )
@@ -380,7 +404,7 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
               await db.collection("directMessages").insertOne({
                 _id: new ObjectId().toString(),
                 automationId: automation._id,
-                recipientUsername: comment.from.username,
+                recipientUsername: comment.from?.username || "unknown",
                 commentId: comment.id,
                 message: fullMessage,
                 type: messageResult.method === "dm" ? "direct" : "comment_fallback",
@@ -393,7 +417,7 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
           }
         } else {
           // Send direct message with fallback
-          let fullMessage = automation.message
+          let fullMessage = automation.message || "Thank you for your comment!"
 
           if (automation.addBranding) {
             fullMessage += `\n\n${automation.brandingMessage || "⚡ Sent via ChatAutoDM — grow your DMs on autopilot"}`
@@ -402,7 +426,7 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
           messageResult = await sendDirectMessageWithFallback(
             validToken,
             instagramAccount.instagramId,
-            comment.from.username,
+            comment.from?.username || "unknown",
             fullMessage,
             comment.id,
           )
@@ -411,7 +435,7 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
           await db.collection("directMessages").insertOne({
             _id: new ObjectId().toString(),
             automationId: automation._id,
-            recipientUsername: comment.from.username,
+            recipientUsername: comment.from?.username || "unknown",
             commentId: comment.id,
             message: fullMessage,
             type: messageResult.method === "dm" ? "direct" : "comment_fallback",
@@ -432,16 +456,16 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
         )
 
         console.log(
-          `Sent message to ${comment.from.username} via ${messageResult.method} for automation ${automation._id}`,
+          `Sent message to ${comment.from?.username} via ${messageResult.method} for automation ${automation._id}`,
         )
       } catch (error) {
-        console.error(`Error sending message to ${comment.from.username}:`, error)
+        console.error(`Error sending message to ${comment.from?.username}:`, error)
 
         // Log the failed message
         await db.collection("directMessages").insertOne({
           _id: new ObjectId().toString(),
           automationId: automation._id,
-          recipientUsername: comment.from.username,
+          recipientUsername: comment.from?.username || "unknown",
           commentId: comment.id,
           message: automation.useOpeningMessage ? automation.openingMessage : automation.message,
           status: "failed",
@@ -495,8 +519,17 @@ async function processButtonClick(data) {
       throw new Error(`Instagram account ${automation.instagramAccountId} not found`)
     }
 
+    // Validate token before using
+    if (
+      !instagramAccount.accessToken ||
+      instagramAccount.accessToken.includes("undefined") ||
+      instagramAccount.accessToken.includes("null")
+    ) {
+      throw new Error(`Invalid token format for account ${instagramAccount.username}`)
+    }
+
     // Send the main content message
-    let fullMessage = automation.message
+    let fullMessage = automation.message || "Thank you for your interest!"
 
     if (automation.addBranding) {
       fullMessage += `\n\n${automation.brandingMessage || "⚡ Sent via ChatAutoDM — grow your DMs on autopilot"}`
@@ -540,6 +573,8 @@ async function processButtonClick(data) {
     await db.collection("directMessages").insertOne({
       _id: new ObjectId().toString(),
       automationId: automation._id,
+      userId: instagramAccount.userId,
+      instagramAccountId: instagramAccount._id,
       recipientUsername: username,
       recipientId: senderId,
       message: fullMessage,
@@ -576,7 +611,7 @@ async function processMessage(messageData) {
   try {
     const { sender, recipient, message, timestamp } = messageData
 
-    console.log(`Processing message from ${sender.id} to ${recipient.id}: "${message.text}"`)
+    console.log(`Processing message from ${sender.id} to ${recipient.id}: "${message?.text || "No text"}"`)
 
     // Find the Instagram account by recipient ID
     const instagramAccount = await db.collection("instagramAccounts").findOne({
@@ -600,7 +635,7 @@ async function processMessage(messageData) {
       senderUsername: sender.username || "unknown",
       recipientId: recipient.id,
       instagramAccountId: instagramAccount._id,
-      message: message.text,
+      message: message?.text || "",
       timestamp: new Date(timestamp),
       createdAt: new Date(),
       processed: false,
@@ -617,13 +652,15 @@ async function processMessage(messageData) {
       let username = "unknown"
       try {
         const token = instagramAccount.pageAccessToken || instagramAccount.accessToken
-        const userResponse = await fetch(
-          `https://graph.facebook.com/v18.0/${sender.id}?fields=username&access_token=${token}`,
-          { cache: "no-store" },
-        )
-        if (userResponse.ok) {
-          const userData = await userResponse.json()
-          username = userData.username || sender.username || "unknown"
+        if (token && !token.includes("undefined") && !token.includes("null")) {
+          const userResponse = await fetch(
+            `https://graph.facebook.com/v18.0/${sender.id}?fields=username&access_token=${token}`,
+            { cache: "no-store" },
+          )
+          if (userResponse.ok) {
+            const userData = await userResponse.json()
+            username = userData.username || sender.username || "unknown"
+          }
         }
       } catch (error) {
         console.error("Error getting username:", error)
@@ -637,7 +674,7 @@ async function processMessage(messageData) {
         senderId: sender.id,
         username: username.toLowerCase(),
         displayName: username,
-        lastMessage: message.text,
+        lastMessage: message?.text || "",
         lastMessageTime: new Date(),
         unread: true,
         createdAt: new Date(),
@@ -653,7 +690,7 @@ async function processMessage(messageData) {
         { _id: contact._id },
         {
           $set: {
-            lastMessage: message.text,
+            lastMessage: message?.text || "",
             lastMessageTime: new Date(),
             unread: true,
             updatedAt: new Date(),
@@ -688,7 +725,7 @@ async function processMessage(messageData) {
     // Check each automated response for trigger keyword match
     for (const automation of automations) {
       if (
-        message.text.toLowerCase().includes(automation.triggerKeyword.toLowerCase()) ||
+        (message?.text && message.text.toLowerCase().includes(automation.triggerKeyword.toLowerCase())) ||
         automation.triggerKeyword === "any"
       ) {
         console.log(`Trigger "${automation.triggerKeyword}" matched in message from ${sender.id}`)
@@ -708,15 +745,26 @@ async function processMessage(messageData) {
           continue
         }
 
+        // Validate token before using
+        if (
+          !instagramAccount.accessToken ||
+          instagramAccount.accessToken.includes("undefined") ||
+          instagramAccount.accessToken.includes("null")
+        ) {
+          console.log(`Invalid token format for account ${instagramAccount.username}, skipping automation`)
+          continue
+        }
+
         // Send the automated response
         try {
-          let responseMessage = automation.message
+          let responseMessage = automation.message || "Thank you for your message!"
 
           if (automation.addBranding) {
             responseMessage += `\n\n${automation.brandingMessage || "⚡ Sent via ChatAutoDM — grow your DMs on autopilot"}`
           }
 
           // Send the DM directly using the Graph API
+          const token = instagramAccount.pageAccessToken || instagramAccount.accessToken
           const dmResponse = await fetch(`https://graph.facebook.com/v18.0/${instagramAccount.instagramId}/messages`, {
             method: "POST",
             headers: {
@@ -725,7 +773,7 @@ async function processMessage(messageData) {
             body: JSON.stringify({
               recipient: { id: sender.id },
               message: { text: responseMessage },
-              access_token: instagramAccount.pageAccessToken || instagramAccount.accessToken,
+              access_token: token,
             }),
           })
 
@@ -769,7 +817,7 @@ async function processMessage(messageData) {
             instagramAccountId: instagramAccount._id,
             recipientUsername: contact.username,
             recipientId: sender.id,
-            message: automation.message,
+            message: automation.message || "",
             status: "failed",
             error: String(error),
             sentAt: new Date(),
@@ -803,6 +851,11 @@ async function processMessage(messageData) {
 // Reply to a comment
 async function replyToComment(accessToken, commentId, replyText) {
   try {
+    // Validate token
+    if (!accessToken || accessToken.includes("undefined") || accessToken.includes("null")) {
+      throw new Error("Invalid access token format")
+    }
+
     const response = await fetch(
       `https://graph.facebook.com/v18.0/${commentId}/replies?message=${encodeURIComponent(replyText)}&access_token=${accessToken}`,
       {
@@ -828,6 +881,11 @@ async function replyToComment(accessToken, commentId, replyText) {
 // Send a direct message
 async function sendDirectMessage(accessToken, instagramAccountId, recipientUsername, message) {
   try {
+    // Validate token
+    if (!accessToken || accessToken.includes("undefined") || accessToken.includes("null")) {
+      throw new Error("Invalid access token format")
+    }
+
     let recipientId = null
 
     // Try multiple approaches to get the user ID
@@ -932,6 +990,11 @@ async function sendDirectMessageWithButton(
   automationId,
 ) {
   try {
+    // Validate token
+    if (!accessToken || accessToken.includes("undefined") || accessToken.includes("null")) {
+      throw new Error("Invalid access token format")
+    }
+
     let recipientId = null
 
     // Try multiple approaches to get the user ID
@@ -1044,6 +1107,11 @@ async function sendDirectMessageWithFallback(
   commentId = null,
 ) {
   try {
+    // Validate token
+    if (!accessToken || accessToken.includes("undefined") || accessToken.includes("null")) {
+      throw new Error("Invalid access token format")
+    }
+
     let recipientId = null
 
     // Try multiple approaches to get the user ID
@@ -1166,6 +1234,11 @@ async function sendDirectMessageWithFallback(
 // Reply to a comment with fallback message
 async function replyToCommentWithFallback(accessToken, commentId, message) {
   try {
+    // Validate token
+    if (!accessToken || accessToken.includes("undefined") || accessToken.includes("null")) {
+      throw new Error("Invalid access token format")
+    }
+
     // Format the message for a comment (shorter, no formatting)
     let commentMessage = message
 
@@ -1233,6 +1306,16 @@ async function checkForComments() {
           continue
         }
 
+        // Validate token before using
+        if (
+          !instagramAccount.accessToken ||
+          instagramAccount.accessToken.includes("undefined") ||
+          instagramAccount.accessToken.includes("null")
+        ) {
+          console.log(`Invalid token format for account ${instagramAccount.username}, skipping automation`)
+          continue
+        }
+
         // Get a valid token
         const validToken = instagramAccount.pageAccessToken || instagramAccount.accessToken
 
@@ -1285,6 +1368,12 @@ async function checkForComments() {
 // Process comments for a post
 async function processPostComments(accessToken, post, automation, instagramAccount) {
   try {
+    // Validate token before using
+    if (!accessToken || accessToken.includes("undefined") || accessToken.includes("null")) {
+      console.log(`Invalid token format for post ${post.instagramId}, skipping`)
+      return
+    }
+
     // Get the last check time
     const lastChecked = automation.lastChecked || new Date(0)
 
@@ -1306,7 +1395,7 @@ async function processPostComments(accessToken, post, automation, instagramAccou
         // Process the comment
         await processComment({
           id: comment.id,
-          text: comment.text,
+          text: comment.text || "",
           media_id: post.instagramId,
           from: {
             id: comment.from?.id || "unknown",
@@ -1325,6 +1414,11 @@ async function processPostComments(accessToken, post, automation, instagramAccou
 // Get comments for a post
 async function getPostComments(accessToken, postId, since) {
   try {
+    // Validate token before using
+    if (!accessToken || accessToken.includes("undefined") || accessToken.includes("null")) {
+      throw new Error("Invalid access token format")
+    }
+
     const url = `https://graph.facebook.com/v18.0/${postId}/comments?fields=id,text,username,timestamp,from&access_token=${accessToken}&limit=50${since ? `&since=${since}` : ""}`
 
     const response = await fetch(url, { cache: "no-store" })
@@ -1339,10 +1433,10 @@ async function getPostComments(accessToken, postId, since) {
 
     return data.data.map((comment) => ({
       id: comment.id,
-      text: comment.text,
-      username: comment.username || comment.from?.username,
+      text: comment.text || "",
+      username: comment.username || comment.from?.username || "unknown",
       timestamp: comment.timestamp,
-      from: comment.from,
+      from: comment.from || { id: "unknown", username: comment.username || "unknown" },
     }))
   } catch (error) {
     console.error("Error fetching post comments:", error)
@@ -1362,6 +1456,24 @@ async function refreshTokens() {
 
     for (const account of accounts) {
       try {
+        // Skip accounts with invalid token format
+        if (!account.accessToken || account.accessToken.includes("undefined") || account.accessToken.includes("null")) {
+          console.log(`Invalid token format for account ${account.username}, marking for reconnection`)
+
+          // Mark the account as needing reconnection
+          await db.collection("instagramAccounts").updateOne(
+            { _id: account._id },
+            {
+              $set: {
+                tokenError: "Invalid token format",
+                tokenErrorAt: new Date(),
+                needsReconnection: true,
+              },
+            },
+          )
+          continue
+        }
+
         // Check if token is expired or will expire soon (within 7 days)
         const now = new Date()
         const expiryDate = account.expiresAt ? new Date(account.expiresAt) : null
@@ -1383,6 +1495,27 @@ async function refreshTokens() {
         if (!response.ok) {
           const errorData = await response.json()
           console.error(`Failed to refresh token for ${account.username}:`, errorData)
+
+          // Log the error
+          await db.collection("tokenRefreshErrors").insertOne({
+            accountId: account._id,
+            username: account.username,
+            error: errorData,
+            timestamp: new Date(),
+          })
+
+          // Mark the account as needing reconnection
+          await db.collection("instagramAccounts").updateOne(
+            { _id: account._id },
+            {
+              $set: {
+                tokenError: "Failed to refresh token automatically",
+                tokenErrorAt: new Date(),
+                needsReconnection: true,
+              },
+            },
+          )
+
           continue
         }
 
@@ -1400,19 +1533,90 @@ async function refreshTokens() {
               accessToken: data.access_token,
               expiresAt: newExpiryDate,
               lastTokenRefresh: new Date(),
+              needsReconnection: false,
+              tokenError: null,
+              tokenErrorAt: null,
             },
           },
         )
 
         console.log(`Successfully refreshed token for ${account.username}, new expiry: ${newExpiryDate}`)
+
+        // Also update page access token if available
+        if (account.pageId && account.pageAccessToken) {
+          try {
+            const pageTokenResponse = await fetch(
+              `https://graph.facebook.com/${account.pageId}?fields=access_token&access_token=${data.access_token}`,
+              { cache: "no-store" },
+            )
+
+            if (pageTokenResponse.ok) {
+              const pageData = await pageTokenResponse.json()
+
+              if (pageData.access_token) {
+                await db.collection("instagramAccounts").updateOne(
+                  { _id: account._id },
+                  {
+                    $set: {
+                      pageAccessToken: pageData.access_token,
+                    },
+                  },
+                )
+
+                console.log(`Updated page access token for ${account.username}`)
+
+                // Re-subscribe to webhooks with the new token
+                try {
+                  await subscribeToWebhooks(account.pageId, pageData.access_token)
+                  console.log(`Re-subscribed to webhooks for ${account.username}`)
+                } catch (webhookError) {
+                  console.error(`Error re-subscribing to webhooks for ${account.username}:`, webhookError)
+                }
+              }
+            }
+          } catch (error) {
+            console.error(`Error refreshing page token for ${account.username}:`, error)
+          }
+        }
       } catch (error) {
-        console.error(`Error refreshing token for account ${account.username}:`, error)
+        console.error(`Error processing account ${account.username}:`, error)
       }
     }
 
     console.log("Finished refreshing tokens")
   } catch (error) {
     console.error("Error refreshing tokens:", error)
+  }
+}
+
+// Function to subscribe to webhooks
+async function subscribeToWebhooks(pageId, pageAccessToken) {
+  try {
+    const webhookUrl = `${process.env.NEXT_PUBLIC_APP_URL}/api/webhooks/instagram`
+
+    // Subscribe to Instagram comments and messages
+    const response = await fetch(`https://graph.facebook.com/v18.0/${pageId}/subscribed_apps`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        subscribed_fields: ["feed", "comments", "messages"],
+        callback_url: webhookUrl,
+        verify_token: process.env.WEBHOOK_VERIFY_TOKEN,
+        access_token: pageAccessToken,
+      }),
+    })
+
+    if (!response.ok) {
+      const errorData = await response.json()
+      throw new Error(`Failed to subscribe to webhooks: ${JSON.stringify(errorData)}`)
+    }
+
+    return await response.json()
+  } catch (error) {
+    console.error("Error subscribing to webhooks:", error)
+    throw error
   }
 }
 
