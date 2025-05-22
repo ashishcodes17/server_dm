@@ -11,7 +11,7 @@ const PORT = process.env.PORT || 3001
 
 // Middleware
 app.use(cors())
-app.use(bodyParser.json())
+app.use(bodyParser.json({ limit: "10mb" }))
 
 // MongoDB connection
 const MONGODB_URI = process.env.MONGODB_URI
@@ -89,6 +89,14 @@ app.post("/api/process-event", authenticateRequest, async (req, res) => {
       default:
         throw new Error(`Unknown event type: ${type}`)
     }
+
+    // Update the event as processed
+    await db
+      .collection("processedEvents")
+      .updateOne(
+        { type, "data.id": data.id || data.mid || data.sender?.id },
+        { $set: { processed: true, processedAt: new Date(), result } },
+      )
 
     res.json({ success: true, result })
   } catch (error) {
@@ -469,6 +477,8 @@ async function processButtonClick(data) {
   try {
     const { automationId, senderId, recipientId } = data
 
+    console.log(`Processing button click: automation=${automationId}, sender=${senderId}, recipient=${recipientId}`)
+
     // Find the automation
     const automation = await db.collection("automations").findOne({ _id: automationId })
 
@@ -531,10 +541,20 @@ async function processButtonClick(data) {
       _id: new ObjectId().toString(),
       automationId: automation._id,
       recipientUsername: username,
+      recipientId: senderId,
       message: fullMessage,
       status: "sent",
       sentAt: new Date(),
     })
+
+    // Update automation stats
+    await db.collection("automations").updateOne(
+      { _id: automation._id },
+      {
+        $inc: { totalDMsSent: 1 },
+        $set: { lastTriggered: new Date() },
+      },
+    )
 
     console.log(`Sent content DM to ${username} for automation ${automation._id}`)
 
@@ -556,7 +576,7 @@ async function processMessage(messageData) {
   try {
     const { sender, recipient, message, timestamp } = messageData
 
-    console.log(`Processing message from ${sender.id} to ${recipient.id}`)
+    console.log(`Processing message from ${sender.id} to ${recipient.id}: "${message.text}"`)
 
     // Find the Instagram account by recipient ID
     const instagramAccount = await db.collection("instagramAccounts").findOne({
@@ -571,8 +591,80 @@ async function processMessage(messageData) {
       }
     }
 
+    console.log(`Found Instagram account: ${instagramAccount.username} for recipient ID: ${recipient.id}`)
+
+    // Store the message in the database
+    await db.collection("incomingMessages").insertOne({
+      _id: new ObjectId().toString(),
+      senderId: sender.id,
+      senderUsername: sender.username || "unknown",
+      recipientId: recipient.id,
+      instagramAccountId: instagramAccount._id,
+      message: message.text,
+      timestamp: new Date(timestamp),
+      createdAt: new Date(),
+      processed: false,
+    })
+
+    // Find or create contact
+    let contact = await db.collection("contacts").findOne({
+      instagramAccountId: instagramAccount._id,
+      senderId: sender.id,
+    })
+
+    if (!contact) {
+      // Try to get username from Facebook Graph API
+      let username = "unknown"
+      try {
+        const token = instagramAccount.pageAccessToken || instagramAccount.accessToken
+        const userResponse = await fetch(
+          `https://graph.facebook.com/v18.0/${sender.id}?fields=username&access_token=${token}`,
+          { cache: "no-store" },
+        )
+        if (userResponse.ok) {
+          const userData = await userResponse.json()
+          username = userData.username || sender.username || "unknown"
+        }
+      } catch (error) {
+        console.error("Error getting username:", error)
+      }
+
+      // Create new contact
+      const newContact = {
+        _id: new ObjectId().toString(),
+        userId: instagramAccount.userId,
+        instagramAccountId: instagramAccount._id,
+        senderId: sender.id,
+        username: username.toLowerCase(),
+        displayName: username,
+        lastMessage: message.text,
+        lastMessageTime: new Date(),
+        unread: true,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      }
+
+      await db.collection("contacts").insertOne(newContact)
+      contact = newContact
+      console.log(`Created new contact: ${username} for sender ID: ${sender.id}`)
+    } else {
+      // Update last message
+      await db.collection("contacts").updateOne(
+        { _id: contact._id },
+        {
+          $set: {
+            lastMessage: message.text,
+            lastMessageTime: new Date(),
+            unread: true,
+            updatedAt: new Date(),
+          },
+        },
+      )
+      console.log(`Updated existing contact: ${contact.username} with new message`)
+    }
+
     // Check for automated responses based on message content
-    const automatedResponses = await db
+    const automations = await db
       .collection("automations")
       .find({
         instagramAccountId: instagramAccount._id,
@@ -581,7 +673,9 @@ async function processMessage(messageData) {
       })
       .toArray()
 
-    if (automatedResponses.length === 0) {
+    console.log(`Found ${automations.length} active message automations for account ${instagramAccount.username}`)
+
+    if (automations.length === 0) {
       console.log(`No active message automations found for account ${recipient.id}`)
       return {
         success: true,
@@ -589,30 +683,30 @@ async function processMessage(messageData) {
       }
     }
 
-    // Get the sender's username
-    let username = "user"
-    try {
-      const userResponse = await fetch(
-        `https://graph.facebook.com/v18.0/${sender.id}?fields=username&access_token=${instagramAccount.pageAccessToken || instagramAccount.accessToken}`,
-        { next: { revalidate: 0 } },
-      )
-      if (userResponse.ok) {
-        const userData = await userResponse.json()
-        username = userData.username
-      }
-    } catch (error) {
-      console.error("Error getting username:", error)
-    }
-
     let messagesSent = 0
 
     // Check each automated response for trigger keyword match
-    for (const automation of automatedResponses) {
+    for (const automation of automations) {
       if (
         message.text.toLowerCase().includes(automation.triggerKeyword.toLowerCase()) ||
         automation.triggerKeyword === "any"
       ) {
         console.log(`Trigger "${automation.triggerKeyword}" matched in message from ${sender.id}`)
+
+        // Check rate limiting
+        const now = new Date()
+        const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000)
+
+        const recentDMs = await db.collection("directMessages").countDocuments({
+          automationId: automation._id,
+          sentAt: { $gte: oneHourAgo },
+          status: "sent",
+        })
+
+        if (recentDMs >= (automation.rateLimit || 10)) {
+          console.log(`Rate limit reached for automation ${automation._id}`)
+          continue
+        }
 
         // Send the automated response
         try {
@@ -622,18 +716,32 @@ async function processMessage(messageData) {
             responseMessage += `\n\n${automation.brandingMessage || "⚡ Sent via ChatAutoDM — grow your DMs on autopilot"}`
           }
 
-          await sendDirectMessage(
-            instagramAccount.pageAccessToken || instagramAccount.accessToken,
-            instagramAccount.instagramId,
-            username,
-            responseMessage,
-          )
+          // Send the DM directly using the Graph API
+          const dmResponse = await fetch(`https://graph.facebook.com/v18.0/${instagramAccount.instagramId}/messages`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              recipient: { id: sender.id },
+              message: { text: responseMessage },
+              access_token: instagramAccount.pageAccessToken || instagramAccount.accessToken,
+            }),
+          })
+
+          if (!dmResponse.ok) {
+            const errorData = await dmResponse.json()
+            throw new Error(`Failed to send direct message: ${JSON.stringify(errorData)}`)
+          }
 
           // Log the sent response
           await db.collection("directMessages").insertOne({
             _id: new ObjectId().toString(),
             automationId: automation._id,
-            recipientUsername: username,
+            userId: instagramAccount.userId,
+            instagramAccountId: instagramAccount._id,
+            recipientUsername: contact.username,
+            recipientId: sender.id,
             message: responseMessage,
             status: "sent",
             sentAt: new Date(),
@@ -649,7 +757,7 @@ async function processMessage(messageData) {
           )
 
           messagesSent++
-          console.log(`Successfully sent automated response to ${username}`)
+          console.log(`Successfully sent automated response to ${contact.username}`)
         } catch (error) {
           console.error(`Error sending automated response to ${sender.id}:`, error)
 
@@ -657,7 +765,10 @@ async function processMessage(messageData) {
           await db.collection("directMessages").insertOne({
             _id: new ObjectId().toString(),
             automationId: automation._id,
-            recipientUsername: username,
+            userId: instagramAccount.userId,
+            instagramAccountId: instagramAccount._id,
+            recipientUsername: contact.username,
+            recipientId: sender.id,
             message: automation.message,
             status: "failed",
             error: String(error),
@@ -666,6 +777,14 @@ async function processMessage(messageData) {
         }
       }
     }
+
+    // Mark the message as processed
+    await db
+      .collection("incomingMessages")
+      .updateMany(
+        { senderId: sender.id, recipientId: recipient.id, processed: false },
+        { $set: { processed: true, processedAt: new Date() } },
+      )
 
     return {
       success: true,
