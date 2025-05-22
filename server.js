@@ -316,52 +316,97 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
 
       // Send the DM
       try {
+        let messageResult
+
         if (automation.useOpeningMessage) {
-          // Send opening message with button
+          // Try to send opening message with button
           const openingMessage =
             automation.openingMessage ||
             "Hey there! I'm so happy you're here, thanks so much for your interest 😊\n\nClick below and I'll send you the link in just a sec ✨"
 
           const buttonText = automation.buttonText || "Send me the link"
 
-          await sendDirectMessageWithButton(
-            validToken,
-            instagramAccount.instagramId,
-            comment.from.username,
-            openingMessage,
-            buttonText,
-            automation._id,
-          )
+          try {
+            await sendDirectMessageWithButton(
+              validToken,
+              instagramAccount.instagramId,
+              comment.from.username,
+              openingMessage,
+              buttonText,
+              automation._id,
+            )
 
-          // Log the sent opening DM
-          await db.collection("directMessages").insertOne({
-            _id: new ObjectId().toString(),
-            automationId: automation._id,
-            recipientUsername: comment.from.username,
-            commentId: comment.id,
-            message: openingMessage,
-            type: "opening",
-            status: "sent",
-            sentAt: new Date(),
-          })
+            // Log the sent opening DM
+            await db.collection("directMessages").insertOne({
+              _id: new ObjectId().toString(),
+              automationId: automation._id,
+              recipientUsername: comment.from.username,
+              commentId: comment.id,
+              message: openingMessage,
+              type: "opening",
+              status: "sent",
+              sentAt: new Date(),
+            })
+
+            messageResult = { success: true, method: "dm_button" }
+          } catch (buttonError) {
+            console.error(`Error sending DM with button to ${comment.from.username}:`, buttonError)
+
+            // Try fallback to regular DM with fallback
+            try {
+              let fullMessage = openingMessage + "\n\n" + automation.message
+
+              if (automation.addBranding) {
+                fullMessage += `\n\n${automation.brandingMessage || "⚡ Sent via ChatAutoDM — grow your DMs on autopilot"}`
+              }
+
+              messageResult = await sendDirectMessageWithFallback(
+                validToken,
+                instagramAccount.instagramId,
+                comment.from.username,
+                fullMessage,
+                comment.id,
+              )
+
+              // Log the sent message
+              await db.collection("directMessages").insertOne({
+                _id: new ObjectId().toString(),
+                automationId: automation._id,
+                recipientUsername: comment.from.username,
+                commentId: comment.id,
+                message: fullMessage,
+                type: messageResult.method === "dm" ? "direct" : "comment_fallback",
+                status: "sent",
+                sentAt: new Date(),
+              })
+            } catch (fallbackError) {
+              throw fallbackError
+            }
+          }
         } else {
-          // Send direct message
+          // Send direct message with fallback
           let fullMessage = automation.message
 
           if (automation.addBranding) {
             fullMessage += `\n\n${automation.brandingMessage || "⚡ Sent via ChatAutoDM — grow your DMs on autopilot"}`
           }
 
-          await sendDirectMessage(validToken, instagramAccount.instagramId, comment.from.username, fullMessage)
+          messageResult = await sendDirectMessageWithFallback(
+            validToken,
+            instagramAccount.instagramId,
+            comment.from.username,
+            fullMessage,
+            comment.id,
+          )
 
-          // Log the sent DM
+          // Log the sent message
           await db.collection("directMessages").insertOne({
             _id: new ObjectId().toString(),
             automationId: automation._id,
             recipientUsername: comment.from.username,
             commentId: comment.id,
             message: fullMessage,
-            type: "direct",
+            type: messageResult.method === "dm" ? "direct" : "comment_fallback",
             status: "sent",
             sentAt: new Date(),
           })
@@ -378,11 +423,13 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
           },
         )
 
-        console.log(`Sent DM to ${comment.from.username} for automation ${automation._id}`)
+        console.log(
+          `Sent message to ${comment.from.username} via ${messageResult.method} for automation ${automation._id}`,
+        )
       } catch (error) {
-        console.error(`Error sending DM to ${comment.from.username}:`, error)
+        console.error(`Error sending message to ${comment.from.username}:`, error)
 
-        // Log the failed DM
+        // Log the failed message
         await db.collection("directMessages").insertOne({
           _id: new ObjectId().toString(),
           automationId: automation._id,
@@ -865,6 +912,174 @@ async function sendDirectMessageWithButton(
     return await dmResponse.json()
   } catch (error) {
     console.error("Error sending direct message with button:", error)
+    throw error
+  }
+}
+
+// Send a direct message with fallback to comment reply
+async function sendDirectMessageWithFallback(
+  accessToken,
+  instagramAccountId,
+  recipientUsername,
+  message,
+  commentId = null,
+) {
+  try {
+    let recipientId = null
+
+    // Try multiple approaches to get the user ID
+    try {
+      // First try the username search endpoint
+      const userSearchResponse = await fetch(
+        `https://graph.facebook.com/v18.0/ig_username_search?q=${recipientUsername}&access_token=${accessToken}`,
+        { cache: "no-store" },
+      )
+
+      if (userSearchResponse.ok) {
+        const userSearchData = await userSearchResponse.json()
+        if (userSearchData.data && userSearchData.data.length > 0) {
+          recipientId = userSearchData.data[0].id
+        }
+      } else {
+        console.log(`Username search failed for ${recipientUsername}, trying alternative method`)
+      }
+    } catch (searchError) {
+      console.error(`Error searching for username ${recipientUsername}:`, searchError)
+    }
+
+    // If username search failed, try business discovery
+    if (!recipientId) {
+      try {
+        const businessDiscoveryResponse = await fetch(
+          `https://graph.facebook.com/v18.0/${instagramAccountId}?fields=business_discovery.username(${recipientUsername})&access_token=${accessToken}`,
+          { cache: "no-store" },
+        )
+
+        if (businessDiscoveryResponse.ok) {
+          const businessData = await businessDiscoveryResponse.json()
+          if (businessData.business_discovery && businessData.business_discovery.id) {
+            recipientId = businessData.business_discovery.id
+          }
+        }
+      } catch (businessError) {
+        console.error(`Error using business discovery for ${recipientUsername}:`, businessError)
+      }
+    }
+
+    // If we still don't have a recipient ID, try one more approach
+    if (!recipientId) {
+      try {
+        // Try to get user info from mentions
+        const mentionsResponse = await fetch(
+          `https://graph.facebook.com/v18.0/${instagramAccountId}/mentions?access_token=${accessToken}`,
+          { cache: "no-store" },
+        )
+
+        if (mentionsResponse.ok) {
+          const mentionsData = await mentionsResponse.json()
+          const mention = mentionsData.data?.find((m) => m.username?.toLowerCase() === recipientUsername.toLowerCase())
+
+          if (mention && mention.id) {
+            recipientId = mention.id
+          }
+        }
+      } catch (mentionsError) {
+        console.error(`Error with mentions approach for ${recipientUsername}:`, mentionsError)
+      }
+    }
+
+    // If we still don't have a recipient ID, try direct ID approach
+    if (!recipientId && /^\d+$/.test(recipientUsername)) {
+      // If the username is all digits, try using it directly as an ID
+      recipientId = recipientUsername
+    }
+
+    // If we have a recipient ID, try to send the DM
+    if (recipientId) {
+      try {
+        // Now send the DM using the Instagram Graph API
+        const dmResponse = await fetch(`https://graph.facebook.com/v18.0/${instagramAccountId}/messages`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            recipient: { id: recipientId },
+            message: { text: message },
+            access_token: accessToken,
+          }),
+          cache: "no-store",
+        })
+
+        if (dmResponse.ok) {
+          return {
+            success: true,
+            method: "dm",
+            response: await dmResponse.json(),
+          }
+        } else {
+          const errorData = await dmResponse.json()
+          console.error(`DM API error: ${JSON.stringify(errorData)}`)
+          throw new Error(`Failed to send direct message: ${JSON.stringify(errorData)}`)
+        }
+      } catch (dmError) {
+        console.error(`Error sending DM to ${recipientUsername}:`, dmError)
+
+        // If we have a comment ID, try to reply to the comment as fallback
+        if (commentId) {
+          return await replyToCommentWithFallback(accessToken, commentId, message)
+        } else {
+          throw dmError
+        }
+      }
+    } else if (commentId) {
+      // If we couldn't get a recipient ID but have a comment ID, use comment reply as fallback
+      return await replyToCommentWithFallback(accessToken, commentId, message)
+    } else {
+      throw new Error(`Could not find Instagram user ID for @${recipientUsername}`)
+    }
+  } catch (error) {
+    console.error("Error in sendDirectMessageWithFallback:", error)
+    throw error
+  }
+}
+
+// Reply to a comment with fallback message
+async function replyToCommentWithFallback(accessToken, commentId, message) {
+  try {
+    // Format the message for a comment (shorter, no formatting)
+    let commentMessage = message
+
+    // Truncate if too long
+    if (commentMessage.length > 300) {
+      commentMessage = commentMessage.substring(0, 297) + "..."
+    }
+
+    // Remove any branding or formatting that wouldn't work well in comments
+    commentMessage = commentMessage.replace(/⚡ Sent via ChatAutoDM.*$/m, "")
+
+    const response = await fetch(
+      `https://graph.facebook.com/v18.0/${commentId}/replies?message=${encodeURIComponent(commentMessage)}&access_token=${accessToken}`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+      },
+    )
+
+    if (!response.ok) {
+      const errorData = await response.json()
+      throw new Error(`Failed to reply to comment: ${JSON.stringify(errorData)}`)
+    }
+
+    return {
+      success: true,
+      method: "comment_reply",
+      response: await response.json(),
+    }
+  } catch (error) {
+    console.error("Error replying to comment with fallback:", error)
     throw error
   }
 }
