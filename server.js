@@ -611,7 +611,10 @@ async function processMessage(messageData) {
   try {
     const { sender, recipient, message, timestamp } = messageData
 
-    console.log(`Processing message from ${sender.id} to ${recipient.id}: "${message?.text || "No text"}"`)
+    console.log(`Processing message from ${sender.id} to ${recipient.id}: "${message?.text || "No text"}"`, {
+      timestamp: new Date().toISOString(),
+      messageData,
+    })
 
     // Find the Instagram account by recipient ID
     const instagramAccount = await db.collection("instagramAccounts").findOne({
@@ -628,34 +631,39 @@ async function processMessage(messageData) {
 
     console.log(`Found Instagram account: ${instagramAccount.username} for recipient ID: ${recipient.id}`)
 
-    // Store the message in the database
+    // Store the message in the database with high priority
+    const messageId = new ObjectId().toString()
     await db.collection("incomingMessages").insertOne({
-      _id: new ObjectId().toString(),
+      _id: messageId,
       senderId: sender.id,
       senderUsername: sender.username || "unknown",
       recipientId: recipient.id,
       instagramAccountId: instagramAccount._id,
       message: message?.text || "",
-      timestamp: new Date(timestamp),
+      timestamp: new Date(timestamp || Date.now()),
       createdAt: new Date(),
+      highPriority: true,
       processed: false,
     })
 
-    // Find or create contact
+    // Find or create contact with improved error handling
     let contact = await db.collection("contacts").findOne({
       instagramAccountId: instagramAccount._id,
       senderId: sender.id,
     })
 
     if (!contact) {
-      // Try to get username from Facebook Graph API
-      let username = "unknown"
+      // Try to get username from Facebook Graph API with better error handling
+      let username = sender.username || "unknown"
       try {
         const token = instagramAccount.pageAccessToken || instagramAccount.accessToken
         if (token && !token.includes("undefined") && !token.includes("null")) {
           const userResponse = await fetch(
             `https://graph.facebook.com/v18.0/${sender.id}?fields=username&access_token=${token}`,
-            { cache: "no-store" },
+            {
+              cache: "no-store",
+              timeout: 5000, // 5 second timeout
+            },
           )
           if (userResponse.ok) {
             const userData = await userResponse.json()
@@ -712,117 +720,148 @@ async function processMessage(messageData) {
 
     console.log(`Found ${automations.length} active message automations for account ${instagramAccount.username}`)
 
-    if (automations.length === 0) {
-      console.log(`No active message automations found for account ${recipient.id}`)
-      return {
-        success: true,
-        message: `No active message automations found for account ${recipient.id}`,
-      }
-    }
-
     let messagesSent = 0
 
-    // Check each automated response for trigger keyword match
+    // Process automations with improved error handling and logging
     for (const automation of automations) {
-      if (
-        (message?.text && message.text.toLowerCase().includes(automation.triggerKeyword.toLowerCase())) ||
-        automation.triggerKeyword === "any"
-      ) {
-        console.log(`Trigger "${automation.triggerKeyword}" matched in message from ${sender.id}`)
-
-        // Check rate limiting
-        const now = new Date()
-        const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000)
-
-        const recentDMs = await db.collection("directMessages").countDocuments({
-          automationId: automation._id,
-          sentAt: { $gte: oneHourAgo },
-          status: "sent",
-        })
-
-        if (recentDMs >= (automation.rateLimit || 10)) {
-          console.log(`Rate limit reached for automation ${automation._id}`)
-          continue
-        }
-
-        // Validate token before using
+      try {
+        // Check if trigger matches
         if (
-          !instagramAccount.accessToken ||
-          instagramAccount.accessToken.includes("undefined") ||
-          instagramAccount.accessToken.includes("null")
+          (message?.text && message.text.toLowerCase().includes(automation.triggerKeyword.toLowerCase())) ||
+          automation.triggerKeyword === "any"
         ) {
-          console.log(`Invalid token format for account ${instagramAccount.username}, skipping automation`)
-          continue
-        }
+          console.log(`Trigger "${automation.triggerKeyword}" matched in message from ${sender.id}`)
 
-        // Send the automated response
-        try {
+          // Check rate limiting
+          const now = new Date()
+          const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000)
+
+          const recentDMs = await db.collection("directMessages").countDocuments({
+            automationId: automation._id,
+            sentAt: { $gte: oneHourAgo },
+            status: "sent",
+          })
+
+          if (recentDMs >= (automation.rateLimit || 10)) {
+            console.log(`Rate limit reached for automation ${automation._id}`)
+            continue
+          }
+
+          // Validate token before using
+          if (
+            !instagramAccount.accessToken ||
+            instagramAccount.accessToken.includes("undefined") ||
+            instagramAccount.accessToken.includes("null")
+          ) {
+            console.log(`Invalid token format for account ${instagramAccount.username}, skipping automation`)
+            continue
+          }
+
+          // Send the automated response with retry logic
           let responseMessage = automation.message || "Thank you for your message!"
 
           if (automation.addBranding) {
             responseMessage += `\n\n${automation.brandingMessage || "⚡ Sent via ChatAutoDM — grow your DMs on autopilot"}`
           }
 
-          // Send the DM directly using the Graph API
-          const token = instagramAccount.pageAccessToken || instagramAccount.accessToken
-          const dmResponse = await fetch(`https://graph.facebook.com/v18.0/${instagramAccount.instagramId}/messages`, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-              recipient: { id: sender.id },
-              message: { text: responseMessage },
-              access_token: token,
-            }),
-          })
+          // Send the DM with retry logic
+          let success = false
+          let error = null
 
-          if (!dmResponse.ok) {
-            const errorData = await dmResponse.json()
-            throw new Error(`Failed to send direct message: ${JSON.stringify(errorData)}`)
+          for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+              // Send the DM directly using the Graph API
+              const token = instagramAccount.pageAccessToken || instagramAccount.accessToken
+              const dmResponse = await fetch(
+                `https://graph.facebook.com/v18.0/${instagramAccount.instagramId}/messages`,
+                {
+                  method: "POST",
+                  headers: {
+                    "Content-Type": "application/json",
+                  },
+                  body: JSON.stringify({
+                    recipient: { id: sender.id },
+                    message: { text: responseMessage },
+                    access_token: token,
+                  }),
+                  cache: "no-store",
+                },
+              )
+
+              if (!dmResponse.ok) {
+                const errorData = await dmResponse.json()
+                throw new Error(`Failed to send direct message: ${JSON.stringify(errorData)}`)
+              }
+
+              success = true
+              break // Exit retry loop on success
+            } catch (sendError) {
+              console.error(`Attempt ${attempt} - Error sending automated response to ${sender.id}:`, sendError)
+              error = sendError
+
+              // Wait before retry (exponential backoff)
+              if (attempt < 3) {
+                await new Promise((resolve) => setTimeout(resolve, attempt * 1000))
+              }
+            }
           }
 
-          // Log the sent response
-          await db.collection("directMessages").insertOne({
-            _id: new ObjectId().toString(),
-            automationId: automation._id,
-            userId: instagramAccount.userId,
-            instagramAccountId: instagramAccount._id,
-            recipientUsername: contact.username,
-            recipientId: sender.id,
-            message: responseMessage,
-            status: "sent",
-            sentAt: new Date(),
-          })
+          // Log the result
+          if (success) {
+            // Log the sent response
+            await db.collection("directMessages").insertOne({
+              _id: new ObjectId().toString(),
+              automationId: automation._id,
+              userId: instagramAccount.userId,
+              instagramAccountId: instagramAccount._id,
+              recipientUsername: contact.username,
+              recipientId: sender.id,
+              message: responseMessage,
+              status: "sent",
+              sentAt: new Date(),
+              isAutomated: true,
+            })
 
-          // Update automation stats
-          await db.collection("automations").updateOne(
-            { _id: automation._id },
-            {
-              $inc: { totalDMsSent: 1 },
-              $set: { lastTriggered: new Date() },
-            },
-          )
+            // Add to messages collection for UI display
+            await db.collection("messages").insertOne({
+              contactId: contact._id,
+              instagramAccountId: instagramAccount._id,
+              fromMe: true,
+              message: responseMessage,
+              timestamp: new Date(),
+              isAutomated: true,
+            })
 
-          messagesSent++
-          console.log(`Successfully sent automated response to ${contact.username}`)
-        } catch (error) {
-          console.error(`Error sending automated response to ${sender.id}:`, error)
+            // Update automation stats
+            await db.collection("automations").updateOne(
+              { _id: automation._id },
+              {
+                $inc: { totalDMsSent: 1 },
+                $set: { lastTriggered: new Date() },
+              },
+            )
 
-          // Log the failed response
-          await db.collection("directMessages").insertOne({
-            _id: new ObjectId().toString(),
-            automationId: automation._id,
-            userId: instagramAccount.userId,
-            instagramAccountId: instagramAccount._id,
-            recipientUsername: contact.username,
-            recipientId: sender.id,
-            message: automation.message || "",
-            status: "failed",
-            error: String(error),
-            sentAt: new Date(),
-          })
+            messagesSent++
+            console.log(`Successfully sent automated response to ${contact.username}`)
+          } else {
+            // Log the failed response
+            await db.collection("directMessages").insertOne({
+              _id: new ObjectId().toString(),
+              automationId: automation._id,
+              userId: instagramAccount.userId,
+              instagramAccountId: instagramAccount._id,
+              recipientUsername: contact.username,
+              recipientId: sender.id,
+              message: responseMessage,
+              status: "failed",
+              error: String(error),
+              sentAt: new Date(),
+              isAutomated: true,
+            })
+          }
         }
+      } catch (automationError) {
+        console.error(`Error processing automation ${automation._id}:`, automationError)
       }
     }
 
@@ -838,12 +877,14 @@ async function processMessage(messageData) {
       success: true,
       message: `Processed message from ${sender.id}`,
       messagesSent,
+      contactId: contact._id,
     }
   } catch (error) {
     console.error("Error processing message:", error)
     return {
       success: false,
       message: `Error: ${error.message}`,
+      error: String(error),
     }
   }
 }
