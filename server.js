@@ -1419,7 +1419,7 @@ async function refreshTokens() {
 // Schedule jobs
 function scheduleJobs() {
   // Check for comments every 5 minutes
-  setInterval(checkForComments, 2 * 60 * 1000)
+  setInterval(checkForComments, 1 * 60 * 1000)
 
   // Refresh tokens every 24 hours
   setInterval(refreshTokens, 24 * 60 * 60 * 1000)
