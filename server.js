@@ -127,6 +127,34 @@ async function processComment(comment) {
   try {
     console.log(`Processing comment: ${comment.id} on media ${comment.media_id} from ${comment.from?.username}`)
 
+    // CRITICAL FIX: Skip processing if the comment is from our own automation accounts
+    const automationAccounts = await db.collection("instagramAccounts").find({}).toArray()
+    const automationUsernames = automationAccounts.map((acc) => acc.username.toLowerCase())
+
+    if (automationUsernames.includes(comment.from?.username?.toLowerCase())) {
+      console.log(`Skipping comment from automation account: ${comment.from?.username}`)
+      return {
+        success: true,
+        message: `Skipped comment from automation account: ${comment.from?.username}`,
+        processed: false,
+      }
+    }
+
+    // Check if this exact comment has already been processed
+    const existingComment = await db.collection("comments").findOne({
+      commentId: comment.id,
+      processed: true,
+    })
+
+    if (existingComment) {
+      console.log(`Comment ${comment.id} already processed, skipping`)
+      return {
+        success: true,
+        message: `Comment ${comment.id} already processed`,
+        processed: false,
+      }
+    }
+
     // Find the post in our database
     const post = await findOrCreatePost(comment.media_id)
 
@@ -266,8 +294,9 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
     console.log(`Found ${automations.length} automations for post ${post._id}`)
 
     let messagesSent = 0
+    let automationProcessed = false
 
-    // Process each automation
+    // Process each automation (but only send ONE message per user)
     for (const automation of automations) {
       // Check if the comment contains the trigger keyword
       const triggerMatched =
@@ -281,15 +310,15 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
 
       console.log(`Trigger "${automation.triggerKeyword}" matched in comment from ${comment.from?.username}`)
 
-      // Check if we've already sent a DM to this user for this automation
+      // CRITICAL FIX: Check if we've already sent ANY DM to this user for ANY automation on this comment
       const existingDM = await db.collection("directMessages").findOne({
-        automationId: automation._id,
         recipientUsername: comment.from?.username,
+        commentId: comment.id,
       })
 
       if (existingDM) {
-        console.log(`Already sent a DM to ${comment.from?.username} for automation ${automation._id}`)
-        continue
+        console.log(`Already sent a DM to ${comment.from?.username} for this comment, skipping all automations`)
+        break // Exit the loop entirely - don't process any more automations for this user
       }
 
       // Check rate limiting
@@ -325,23 +354,30 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
         continue
       }
 
-      // Reply to the comment if enabled
-      if (automation.replyToComments) {
+      // Reply to the comment if enabled (only once per comment)
+      if (automation.replyToComments && !automationProcessed) {
         try {
-          await replyToComment(validToken, comment.id, automation.commentReply || "Thanks! Please check your DMs.")
-
-          console.log(`Replied to comment ${comment.id}`)
-
-          // Log the comment reply
-          await db.collection("commentReplies").insertOne({
-            _id: new ObjectId().toString(),
-            automationId: automation._id,
+          // Check if we've already replied to this comment
+          const existingReply = await db.collection("commentReplies").findOne({
             commentId: comment.id,
-            username: comment.from?.username || "unknown",
-            reply: automation.commentReply || "Thanks! Please check your DMs.",
-            status: "sent",
-            sentAt: new Date(),
           })
+
+          if (!existingReply) {
+            await replyToComment(validToken, comment.id, automation.commentReply || "Thanks! Please check your DMs.")
+
+            console.log(`Replied to comment ${comment.id}`)
+
+            // Log the comment reply
+            await db.collection("commentReplies").insertOne({
+              _id: new ObjectId().toString(),
+              automationId: automation._id,
+              commentId: comment.id,
+              username: comment.from?.username || "unknown",
+              reply: automation.commentReply || "Thanks! Please check your DMs.",
+              status: "sent",
+              sentAt: new Date(),
+            })
+          }
         } catch (error) {
           console.error(`Error replying to comment ${comment.id}:`, error)
         }
@@ -352,7 +388,7 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
         let messageResult
 
         if (automation.useOpeningMessage) {
-          // Try to send opening message with quick replies (as per the documentation)
+          // Try to send opening message with quick replies
           const openingMessage =
             automation.openingMessage ||
             "Hey there! I'm so happy you're here, thanks so much for your interest 😊\n\nClick below and I'll send you the link in just a sec ✨"
@@ -405,11 +441,12 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
           } catch (buttonError) {
             console.error(`Error sending DM with quick replies to ${comment.from?.username}:`, buttonError)
 
-            // Try fallback to regular DM
+            // Try fallback to regular DM with branding
             try {
               let fullMessage = openingMessage + "\n\n" + automation.message
 
-              if (automation.addBranding) {
+              // CRITICAL FIX: Always add branding
+              if (automation.addBranding !== false) {
                 fullMessage += `\n\n${automation.brandingMessage || "⚡ Sent via ChatAutoDM — grow your DMs on autopilot"}`
               }
 
@@ -450,10 +487,11 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
             }
           }
         } else {
-          // Send direct message
+          // Send direct message with branding
           let fullMessage = automation.message || "Thank you for your comment!"
 
-          if (automation.addBranding) {
+          // CRITICAL FIX: Always add branding
+          if (automation.addBranding !== false) {
             fullMessage += `\n\n${automation.brandingMessage || "⚡ Sent via ChatAutoDM — grow your DMs on autopilot"}`
           }
 
@@ -492,6 +530,7 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
         }
 
         messagesSent++
+        automationProcessed = true
 
         // Update automation stats
         await db.collection("automations").updateOne(
@@ -505,6 +544,9 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
         console.log(
           `Sent message to ${comment.from?.username} via ${messageResult.method} for automation ${automation._id}`,
         )
+
+        // CRITICAL FIX: Break after sending one message to prevent duplicates
+        break
       } catch (error) {
         console.error(`Error sending message to ${comment.from?.username}:`, error)
 
@@ -576,10 +618,11 @@ async function processButtonClick(data) {
       throw new Error(`Invalid token format for account ${instagramAccount.username}`)
     }
 
-    // Send the main content message
+    // Send the main content message with branding
     let fullMessage = automation.message || "Thank you for your interest!"
 
-    if (automation.addBranding) {
+    // CRITICAL FIX: Always add branding
+    if (automation.addBranding !== false) {
       fullMessage += `\n\n${automation.brandingMessage || "⚡ Sent via ChatAutoDM — grow your DMs on autopilot"}`
     }
 
@@ -664,6 +707,16 @@ async function processMessage(messageData) {
       messageData,
     })
 
+    // CRITICAL FIX: Skip echo messages (messages sent by our automation)
+    if (messageData.message?.is_echo) {
+      console.log("Skipping echo message (sent by automation)")
+      return {
+        success: true,
+        message: "Skipped echo message",
+        processed: false,
+      }
+    }
+
     // Find the Instagram account by recipient ID
     const instagramAccount = await db.collection("instagramAccounts").findOne({
       instagramId: recipient.id,
@@ -678,6 +731,23 @@ async function processMessage(messageData) {
     }
 
     console.log(`Found Instagram account: ${instagramAccount.username} for recipient ID: ${recipient.id}`)
+
+    // Check if this exact message has already been processed
+    const existingMessage = await db.collection("incomingMessages").findOne({
+      senderId: sender.id,
+      message: message?.text || "",
+      timestamp: new Date(timestamp || Date.now()),
+      processed: true,
+    })
+
+    if (existingMessage) {
+      console.log("Message already processed, skipping")
+      return {
+        success: true,
+        message: "Message already processed",
+        processed: false,
+      }
+    }
 
     // Store the message
     const messageId = new ObjectId().toString()
@@ -788,6 +858,18 @@ async function processMessage(messageData) {
         ) {
           console.log(`Trigger "${automation.triggerKeyword}" matched in message from ${sender.id}`)
 
+          // CRITICAL FIX: Check if we've already sent a response to this user for this automation
+          const existingResponse = await db.collection("directMessages").findOne({
+            automationId: automation._id,
+            recipientId: sender.id,
+            status: "sent",
+          })
+
+          if (existingResponse) {
+            console.log(`Already sent a response to ${sender.id} for automation ${automation._id}`)
+            continue
+          }
+
           // Check rate limiting
           const now = new Date()
           const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000)
@@ -816,7 +898,8 @@ async function processMessage(messageData) {
           // Send the automated response with retry logic
           let responseMessage = automation.message || "Thank you for your message!"
 
-          if (automation.addBranding) {
+          // CRITICAL FIX: Always add branding
+          if (automation.addBranding !== false) {
             responseMessage += `\n\n${automation.brandingMessage || "⚡ Sent via ChatAutoDM — grow your DMs on autopilot"}`
           }
 
@@ -1110,262 +1193,6 @@ function scheduleJobs() {
     }
   }, 60 * 1000)
 
-  // Check for comments every 5 minutes
-  setInterval(
-    async () => {
-      try {
-        console.log("Running scheduled job to check for comments")
-
-        // Get all active automations
-        const automations = await db
-          .collection("automations")
-          .find({
-            active: true,
-            type: "comment", // Only get comment automations
-          })
-          .toArray()
-
-        console.log(`Found ${automations.length} active comment automations`)
-
-        let totalProcessed = 0
-
-        for (const automation of automations) {
-          try {
-            // Get the Instagram account
-            const instagramAccount = await db.collection("instagramAccounts").findOne({
-              _id: automation.instagramAccountId,
-            })
-
-            if (!instagramAccount) {
-              console.log(
-                `Instagram account ${automation.instagramAccountId} not found for automation ${automation._id}`,
-              )
-              continue
-            }
-
-            // Validate token before using
-            if (
-              !instagramAccount.accessToken ||
-              instagramAccount.accessToken.includes("undefined") ||
-              instagramAccount.accessToken.includes("null")
-            ) {
-              console.log(`Invalid token format for account ${instagramAccount.username}, skipping automation`)
-              continue
-            }
-
-            // Get a valid token
-            const validToken = instagramAccount.accessToken
-
-            if (!validToken) {
-              console.log(`No valid token for Instagram account ${instagramAccount.username}`)
-              continue
-            }
-
-            // For "any post" automations, check all posts from this account
-            if (!automation.postId) {
-              console.log(`Processing "any post" automation ${automation._id}`)
-
-              // Get all posts for this account
-              const posts = await db.collection("posts").find({ instagramAccountId: instagramAccount._id }).toArray()
-
-              console.log(`Found ${posts.length} posts for account ${instagramAccount._id}`)
-
-              // If no posts found, try to fetch them from Instagram
-              if (posts.length === 0) {
-                try {
-                  console.log(`Fetching posts for account ${instagramAccount.username}`)
-                  // Use graph.instagram.com as per the documentation
-                  const response = await fetch(
-                    `https://graph.instagram.com/me/media?fields=id,caption,permalink&access_token=${validToken}&limit=10`,
-                    { cache: "no-store" },
-                  )
-
-                  if (response.ok) {
-                    const data = await response.json()
-                    console.log(`Fetched ${data.data?.length || 0} posts from Instagram API`)
-
-                    if (data.data && data.data.length > 0) {
-                      for (const postData of data.data) {
-                        // Create a new post
-                        const newPost = {
-                          _id: new ObjectId().toString(),
-                          instagramAccountId: instagramAccount._id,
-                          instagramId: postData.id,
-                          caption: postData.caption || "",
-                          permalink: postData.permalink || "",
-                          createdAt: new Date(),
-                          updatedAt: new Date(),
-                        }
-
-                        await db.collection("posts").insertOne(newPost)
-                        console.log(`Created new post for media ${postData.id}`)
-
-                        // Process comments for this post
-                        await processPostComments(validToken, newPost, automation, instagramAccount)
-                        totalProcessed++
-                      }
-                    }
-                  } else {
-                    const errorData = await response.json()
-                    console.error(`Error fetching posts: ${JSON.stringify(errorData)}`)
-                  }
-                } catch (error) {
-                  console.error(`Error fetching posts for account ${instagramAccount._id}:`, error)
-                }
-              } else {
-                // Process existing posts
-                for (const post of posts) {
-                  await processPostComments(validToken, post, automation, instagramAccount)
-                  totalProcessed++
-                }
-              }
-
-              continue
-            }
-
-            // Get the post
-            const post = await db.collection("posts").findOne({
-              _id: automation.postId,
-            })
-
-            if (!post) {
-              console.log(`Post ${automation.postId} not found for automation ${automation._id}`)
-              continue
-            }
-
-            await processPostComments(validToken, post, automation, instagramAccount)
-            totalProcessed++
-
-            // Update the last checked time
-            await db.collection("automations").updateOne({ _id: automation._id }, { $set: { lastChecked: new Date() } })
-          } catch (error) {
-            console.error(`Error processing automation ${automation._id}:`, error)
-          }
-        }
-
-        console.log(`Finished checking for comments. Processed ${totalProcessed} posts.`)
-      } catch (error) {
-        console.error("Error checking for comments:", error)
-      }
-    },
-    5 * 60 * 1000,
-  )
-
-  // Refresh tokens every 24 hours
-  setInterval(
-    async () => {
-      try {
-        console.log("Running scheduled job to refresh tokens")
-
-        // Get all Instagram accounts
-        const accounts = await db.collection("instagramAccounts").find({}).toArray()
-
-        console.log(`Found ${accounts.length} Instagram accounts`)
-
-        for (const account of accounts) {
-          try {
-            // Skip accounts with invalid token format
-            if (
-              !account.accessToken ||
-              account.accessToken.includes("undefined") ||
-              account.accessToken.includes("null")
-            ) {
-              console.log(`Invalid token format for account ${account.username}, marking for reconnection`)
-
-              // Mark the account as needing reconnection
-              await db.collection("instagramAccounts").updateOne(
-                { _id: account._id },
-                {
-                  $set: {
-                    tokenError: "Invalid token format",
-                    tokenErrorAt: new Date(),
-                    needsReconnection: true,
-                  },
-                },
-              )
-              continue
-            }
-
-            // Check if token is expired or will expire soon (within 7 days)
-            const now = new Date()
-            const expiryDate = account.expiresAt ? new Date(account.expiresAt) : null
-            const sevenDaysFromNow = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000)
-
-            // If token doesn't expire or expiry is more than 7 days away, skip
-            if (!expiryDate || expiryDate > sevenDaysFromNow) {
-              continue
-            }
-
-            console.log(`Refreshing token for Instagram account: ${account.username} (expires: ${expiryDate})`)
-
-            // Refresh the long-lived token using graph.instagram.com
-            const response = await fetch(
-              `https://graph.instagram.com/refresh_access_token?grant_type=ig_refresh_token&access_token=${account.accessToken}`,
-              { cache: "no-store" },
-            )
-
-            if (!response.ok) {
-              const errorData = await response.json()
-              console.error(`Failed to refresh token for ${account.username}:`, errorData)
-
-              // Log the error
-              await db.collection("tokenRefreshErrors").insertOne({
-                accountId: account._id,
-                username: account.username,
-                error: errorData,
-                timestamp: new Date(),
-              })
-
-              // Mark the account as needing reconnection
-              await db.collection("instagramAccounts").updateOne(
-                { _id: account._id },
-                {
-                  $set: {
-                    tokenError: "Failed to refresh token automatically",
-                    tokenErrorAt: new Date(),
-                    needsReconnection: true,
-                  },
-                },
-              )
-
-              continue
-            }
-
-            const data = await response.json()
-
-            // Calculate new expiry date
-            const newExpiryDate = new Date()
-            newExpiryDate.setSeconds(newExpiryDate.getSeconds() + data.expires_in)
-
-            // Update the account with new token and expiry
-            await db.collection("instagramAccounts").updateOne(
-              { _id: account._id },
-              {
-                $set: {
-                  accessToken: data.access_token,
-                  expiresAt: newExpiryDate,
-                  lastTokenRefresh: new Date(),
-                  needsReconnection: false,
-                  tokenError: null,
-                  tokenErrorAt: null,
-                },
-              },
-            )
-
-            console.log(`Successfully refreshed token for ${account.username}, new expiry: ${newExpiryDate}`)
-          } catch (error) {
-            console.error(`Error processing account ${account.username}:`, error)
-          }
-        }
-
-        console.log("Finished refreshing tokens")
-      } catch (error) {
-        console.error("Error refreshing tokens:", error)
-      }
-    },
-    24 * 60 * 60 * 1000,
-  )
-
   console.log("Scheduled jobs initialized")
 }
 
@@ -1422,158 +1249,6 @@ async function startServer() {
 
     // Schedule jobs
     scheduleJobs()
-
-    // Run initial jobs
-    setTimeout(async () => {
-      try {
-        console.log("Running initial token refresh job")
-        // Get all Instagram accounts
-        const accounts = await db.collection("instagramAccounts").find({}).toArray()
-
-        console.log(`Found ${accounts.length} Instagram accounts`)
-
-        for (const account of accounts) {
-          try {
-            // Skip accounts with invalid token format
-            if (
-              !account.accessToken ||
-              account.accessToken.includes("undefined") ||
-              account.accessToken.includes("null")
-            ) {
-              console.log(`Invalid token format for account ${account.username}, marking for reconnection`)
-
-              // Mark the account as needing reconnection
-              await db.collection("instagramAccounts").updateOne(
-                { _id: account._id },
-                {
-                  $set: {
-                    tokenError: "Invalid token format",
-                    tokenErrorAt: new Date(),
-                    needsReconnection: true,
-                  },
-                },
-              )
-              continue
-            }
-
-            // Validate the token
-            try {
-              const response = await fetch(
-                `https://graph.instagram.com/me?fields=id,username&access_token=${account.accessToken}`,
-                { cache: "no-store" },
-              )
-
-              if (!response.ok) {
-                const errorData = await response.json()
-                console.error(`Token validation failed for ${account.username}:`, errorData)
-
-                // Mark the account as needing reconnection
-                await db.collection("instagramAccounts").updateOne(
-                  { _id: account._id },
-                  {
-                    $set: {
-                      tokenError: "Token validation failed",
-                      tokenErrorAt: new Date(),
-                      needsReconnection: true,
-                    },
-                  },
-                )
-                continue
-              }
-
-              console.log(`Token validated for ${account.username}`)
-            } catch (validationError) {
-              console.error(`Error validating token for ${account.username}:`, validationError)
-
-              // Mark the account as needing reconnection
-              await db.collection("instagramAccounts").updateOne(
-                { _id: account._id },
-                {
-                  $set: {
-                    tokenError: "Token validation error",
-                    tokenErrorAt: new Date(),
-                    needsReconnection: true,
-                  },
-                },
-              )
-              continue
-            }
-
-            // Check if token is expired or will expire soon (within 7 days)
-            const now = new Date()
-            const expiryDate = account.expiresAt ? new Date(account.expiresAt) : null
-            const sevenDaysFromNow = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000)
-
-            // If token doesn't expire or expiry is more than 7 days away, skip
-            if (!expiryDate || expiryDate > sevenDaysFromNow) {
-              continue
-            }
-
-            console.log(`Refreshing token for Instagram account: ${account.username} (expires: ${expiryDate})`)
-
-            // Refresh the long-lived token
-            const response = await fetch(
-              `https://graph.instagram.com/refresh_access_token?grant_type=ig_refresh_token&access_token=${account.accessToken}`,
-              { cache: "no-store" },
-            )
-
-            if (!response.ok) {
-              const errorData = await response.json()
-              console.error(`Failed to refresh token for ${account.username}:`, errorData)
-
-              // Log the error
-              await db.collection("tokenRefreshErrors").insertOne({
-                accountId: account._id,
-                username: account.username,
-                error: errorData,
-                timestamp: new Date(),
-              })
-
-              // Mark the account as needing reconnection
-              await db.collection("instagramAccounts").updateOne(
-                { _id: account._id },
-                {
-                  $set: {
-                    tokenError: "Failed to refresh token automatically",
-                    tokenErrorAt: new Date(),
-                    needsReconnection: true,
-                  },
-                },
-              )
-
-              continue
-            }
-
-            const data = await response.json()
-
-            // Calculate new expiry date
-            const newExpiryDate = new Date()
-            newExpiryDate.setSeconds(newExpiryDate.getSeconds() + data.expires_in)
-
-            // Update the account with new token and expiry
-            await db.collection("instagramAccounts").updateOne(
-              { _id: account._id },
-              {
-                $set: {
-                  accessToken: data.access_token,
-                  expiresAt: newExpiryDate,
-                  lastTokenRefresh: new Date(),
-                  needsReconnection: false,
-                  tokenError: null,
-                  tokenErrorAt: null,
-                },
-              },
-            )
-
-            console.log(`Successfully refreshed token for ${account.username}, new expiry: ${newExpiryDate}`)
-          } catch (error) {
-            console.error(`Error processing account ${account.username}:`, error)
-          }
-        }
-      } catch (error) {
-        console.error("Error in initial token refresh job:", error)
-      }
-    }, 10000)
 
     app.listen(PORT, () => {
       console.log(`Server running on port ${PORT}`)
