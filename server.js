@@ -665,43 +665,69 @@ async function processMessage(messageData) {
       messageData,
     })
 
-    // Find the Instagram account by recipient ID
-    // First try exact match on instagramId
+    // Find the Instagram account by recipient ID - with improved lookup
+    const clientPromise = new Promise((resolve) => resolve(client))
+    const client = await clientPromise
+    const db = client.db("instaautodm")
+
+    // Log all accounts for debugging
+    const allAccounts = await db.collection("instagramAccounts").find({}).toArray()
+    console.log(
+      "Available Instagram accounts:",
+      JSON.stringify(
+        allAccounts.map((a) => ({
+          _id: a._id,
+          username: a.username,
+          instagramId: a.instagramId,
+          pageId: a.pageId,
+        })),
+      ),
+    )
+
+    // Try multiple fields that might contain the recipient ID
     let instagramAccount = await db.collection("instagramAccounts").findOne({
-      instagramId: recipient.id,
+      $or: [
+        { instagramId: recipient.id },
+        { pageId: recipient.id },
+        { instagramBusinessId: recipient.id },
+        { businessId: recipient.id },
+        { igBusinessId: recipient.id },
+        { "metadata.id": recipient.id },
+        { "metadata.instagram_business_account.id": recipient.id },
+      ],
     })
 
-    // If not found, try to find by pageId
     if (!instagramAccount) {
-      instagramAccount = await db.collection("instagramAccounts").findOne({
-        pageId: recipient.id,
-      })
-    }
+      // If not found by direct match, try to find by string inclusion
+      // This handles cases where the ID might be embedded in another field
+      const recipientIdStr = String(recipient.id)
 
-    // If still not found, try to find by any field that might contain the ID
-    if (!instagramAccount) {
-      // Log all accounts for debugging
-      const allAccounts = await db.collection("instagramAccounts").find({}).toArray()
-      console.log(
-        "All Instagram accounts:",
-        JSON.stringify(
-          allAccounts.map((a) => ({
-            _id: a._id,
-            username: a.username,
-            instagramId: a.instagramId,
-            pageId: a.pageId,
-          })),
-        ),
-      )
+      for (const account of allAccounts) {
+        // Check all string fields for the recipient ID
+        for (const [key, value] of Object.entries(account)) {
+          if (typeof value === "string" && value.includes(recipientIdStr)) {
+            console.log(`Found match in account ${account.username}, field ${key} contains ${recipientIdStr}`)
+            instagramAccount = account
+            break
+          }
+        }
 
-      // Try to find by any field that might contain the ID
-      instagramAccount = await db.collection("instagramAccounts").findOne({
-        $or: [{ instagramBusinessId: recipient.id }, { businessId: recipient.id }, { igBusinessId: recipient.id }],
-      })
+        if (instagramAccount) break
+      }
     }
 
     if (!instagramAccount) {
       console.log(`Instagram account with ID ${recipient.id} not found`)
+
+      // Create a record of the unmatched message for debugging
+      await db.collection("unmatchedMessages").insertOne({
+        senderId: sender.id,
+        recipientId: recipient.id,
+        message: message?.text || "",
+        timestamp: new Date(timestamp || Date.now()),
+        createdAt: new Date(),
+      })
+
       return {
         success: false,
         message: `Instagram account with ID ${recipient.id} not found`,
@@ -710,6 +736,7 @@ async function processMessage(messageData) {
 
     console.log(`Found Instagram account: ${instagramAccount.username} for recipient ID: ${recipient.id}`)
 
+    // Rest of the function remains the same...
     // Store the message in the database with high priority
     const messageId = new ObjectId().toString()
     await db.collection("incomingMessages").insertOne({
@@ -843,8 +870,17 @@ async function processMessage(messageData) {
             instagramAccount.accessToken.includes("undefined") ||
             instagramAccount.accessToken.includes("null")
           ) {
-            console.log(`Invalid token format for account ${instagramAccount.username}, skipping automation`)
-            continue
+            console.log(`Invalid token format for account ${instagramAccount.username}, trying page token`)
+
+            // Try page token if available
+            if (
+              !instagramAccount.pageAccessToken ||
+              instagramAccount.pageAccessToken.includes("undefined") ||
+              instagramAccount.pageAccessToken.includes("null")
+            ) {
+              console.log(`No valid token available for account ${instagramAccount.username}, skipping automation`)
+              continue
+            }
           }
 
           // Send the automated response with retry logic
