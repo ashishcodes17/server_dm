@@ -5,6 +5,9 @@ const { MongoClient, ObjectId } = require("mongodb")
 const cors = require("cors")
 const fetch = require("node-fetch")
 
+// Add this at the top of the file
+const { runMigrations } = require("../lib/migrations")
+
 // Initialize Express app
 const app = express()
 const PORT = process.env.PORT || 3001
@@ -717,10 +720,57 @@ async function processMessage(messageData) {
       }
     }
 
-    // Find the Instagram account by recipient ID
-    const instagramAccount = await db.collection("instagramAccounts").findOne({
+    // Find the Instagram account by recipient ID using our new function
+    let instagramAccount = null
+
+    // First try to find by instagramId
+    instagramAccount = await db.collection("instagramAccounts").findOne({
       instagramId: recipient.id,
     })
+
+    // If not found, try to find by recipientId (for backwards compatibility)
+    if (!instagramAccount) {
+      instagramAccount = await db.collection("instagramAccounts").findOne({
+        recipientId: recipient.id,
+      })
+
+      // If found, update the account with the Instagram ID for future lookups
+      if (instagramAccount) {
+        await db.collection("instagramAccounts").updateOne(
+          { _id: instagramAccount._id },
+          {
+            $set: {
+              instagramId: recipient.id,
+              updatedAt: new Date(),
+            },
+          },
+        )
+      }
+    }
+
+    // If still not found, check if we have any accounts at all
+    if (!instagramAccount) {
+      const accounts = await db.collection("instagramAccounts").find({}).toArray()
+
+      if (accounts.length > 0) {
+        // Use the first account as a fallback
+        instagramAccount = accounts[0]
+        console.log(`Using fallback Instagram account ${instagramAccount.username} for ID ${recipient.id}`)
+
+        // Store this mapping for future use
+        await db.collection("instagramIdMappings").updateOne(
+          { instagramId: recipient.id },
+          {
+            $set: {
+              accountId: instagramAccount._id,
+              createdAt: new Date(),
+              updatedAt: new Date(),
+            },
+          },
+          { upsert: true },
+        )
+      }
+    }
 
     if (!instagramAccount) {
       console.log(`No Instagram account found for recipient ID: ${recipient.id}`)
@@ -852,10 +902,11 @@ async function processMessage(messageData) {
     for (const automation of automations) {
       try {
         // Check if trigger matches
-        if (
-          (message?.text && message.text.toLowerCase().includes(automation.triggerKeyword.toLowerCase())) ||
-          automation.triggerKeyword === "any"
-        ) {
+        const triggerMatched =
+          automation.triggerKeyword === "any" ||
+          (message?.text && message.text.toLowerCase().includes(automation.triggerKeyword.toLowerCase()))
+
+        if (triggerMatched) {
           console.log(`Trigger "${automation.triggerKeyword}" matched in message from ${sender.id}`)
 
           // CRITICAL FIX: Check if we've already sent a response to this user for this automation
@@ -863,10 +914,11 @@ async function processMessage(messageData) {
             automationId: automation._id,
             recipientId: sender.id,
             status: "sent",
+            sentAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) }, // Within last 24 hours
           })
 
           if (existingResponse) {
-            console.log(`Already sent a response to ${sender.id} for automation ${automation._id}`)
+            console.log(`Already sent a response to ${sender.id} for automation ${automation._id} in the last 24 hours`)
             continue
           }
 
@@ -997,6 +1049,8 @@ async function processMessage(messageData) {
               isAutomated: true,
             })
           }
+        } else {
+          console.log(`Trigger "${automation.triggerKeyword}" not matched in message: ${message?.text || "No text"}`)
         }
       } catch (automationError) {
         console.error(`Error processing automation ${automation._id}:`, automationError)
@@ -1139,11 +1193,33 @@ function scheduleJobs() {
 
       console.log(`Processing ${pendingMessages.length} pending messages`)
 
-      for (const message of pendingMessages) {
+      // CRITICAL FIX: Skip messages that are too old (more than 24 hours)
+      const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000)
+      const recentMessages = pendingMessages.filter((msg) => !msg.timestamp || new Date(msg.timestamp) > oneDayAgo)
+
+      if (recentMessages.length < pendingMessages.length) {
+        console.log(`Skipping ${pendingMessages.length - recentMessages.length} messages that are too old`)
+
+        // Mark old messages as processed
+        const oldMessageIds = pendingMessages
+          .filter((msg) => msg.timestamp && new Date(msg.timestamp) <= oneDayAgo)
+          .map((msg) => msg._id)
+
+        if (oldMessageIds.length > 0) {
+          await db
+            .collection("incomingMessages")
+            .updateMany(
+              { _id: { $in: oldMessageIds } },
+              { $set: { processed: true, processedAt: new Date(), skipped: true, skipReason: "Too old" } },
+            )
+        }
+      }
+
+      for (const message of recentMessages) {
         try {
           await processMessage({
             sender: { id: message.senderId, username: message.senderUsername },
-            recipient: { id: message.recipientId },
+            recipient: { id: message.recipientId || "unknown" },
             message: { text: message.message },
             timestamp: message.timestamp,
           })
@@ -1242,10 +1318,13 @@ async function processPostComments(accessToken, post, automation, instagramAccou
   }
 }
 
-// Start the server
+// Update the startServer function
 async function startServer() {
   try {
     await connectToMongoDB()
+
+    // Run migrations
+    await runMigrations()
 
     // Schedule jobs
     scheduleJobs()
