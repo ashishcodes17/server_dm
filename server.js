@@ -173,11 +173,12 @@ async function findOrCreatePost(mediaId) {
         }
 
         // Try to fetch the post details using the account's token
-        const token = account.pageAccessToken || account.accessToken
+        const token = account.accessToken
         if (!token) continue
 
+        // Use graph.instagram.com instead of graph.facebook.com as per the documentation
         const response = await fetch(
-          `https://graph.facebook.com/v18.0/${mediaId}?fields=id,permalink,caption&access_token=${token}`,
+          `https://graph.instagram.com/${mediaId}?fields=id,permalink,caption&access_token=${token}`,
           { next: { revalidate: 0 } },
         )
 
@@ -317,7 +318,7 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
       }
 
       // Get a valid token for this account
-      const validToken = instagramAccount.pageAccessToken || instagramAccount.accessToken
+      const validToken = instagramAccount.accessToken
 
       if (!validToken) {
         console.error(`No valid token available for account ${instagramAccount.username}`)
@@ -351,7 +352,7 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
         let messageResult
 
         if (automation.useOpeningMessage) {
-          // Try to send opening message with button
+          // Try to send opening message with quick replies (as per the documentation)
           const openingMessage =
             automation.openingMessage ||
             "Hey there! I'm so happy you're here, thanks so much for your interest 😊\n\nClick below and I'll send you the link in just a sec ✨"
@@ -359,14 +360,15 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
           const buttonText = automation.buttonText || "Send me the link"
 
           try {
-            // Use Facebook Graph API to send message with button
-            const response = await fetch(`https://graph.facebook.com/v18.0/${instagramAccount.instagramId}/messages`, {
+            // Use Instagram Graph API to send message with quick replies
+            const response = await fetch(`https://graph.instagram.com/${instagramAccount.instagramId}/messages`, {
               method: "POST",
               headers: {
                 "Content-Type": "application/json",
               },
               body: JSON.stringify({
                 recipient: { id: comment.from.id },
+                messaging_type: "RESPONSE",
                 message: {
                   text: openingMessage,
                   quick_replies: [
@@ -383,7 +385,7 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
 
             if (!response.ok) {
               const errorData = await response.json()
-              throw new Error(`Failed to send message with button: ${JSON.stringify(errorData)}`)
+              throw new Error(`Failed to send message with quick replies: ${JSON.stringify(errorData)}`)
             }
 
             // Log the sent opening DM
@@ -399,11 +401,11 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
               sentAt: new Date(),
             })
 
-            messageResult = { success: true, method: "dm_button" }
+            messageResult = { success: true, method: "quick_replies" }
           } catch (buttonError) {
-            console.error(`Error sending DM with button to ${comment.from?.username}:`, buttonError)
+            console.error(`Error sending DM with quick replies to ${comment.from?.username}:`, buttonError)
 
-            // Try fallback to regular DM with fallback
+            // Try fallback to regular DM
             try {
               let fullMessage = openingMessage + "\n\n" + automation.message
 
@@ -411,21 +413,18 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
                 fullMessage += `\n\n${automation.brandingMessage || "⚡ Sent via ChatAutoDM — grow your DMs on autopilot"}`
               }
 
-              // Use Facebook Graph API to send regular message
-              const response = await fetch(
-                `https://graph.facebook.com/v18.0/${instagramAccount.instagramId}/messages`,
-                {
-                  method: "POST",
-                  headers: {
-                    "Content-Type": "application/json",
-                  },
-                  body: JSON.stringify({
-                    recipient: { id: comment.from.id },
-                    message: { text: fullMessage },
-                    access_token: validToken,
-                  }),
+              // Use Instagram Graph API to send regular message
+              const response = await fetch(`https://graph.instagram.com/${instagramAccount.instagramId}/messages`, {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
                 },
-              )
+                body: JSON.stringify({
+                  recipient: { id: comment.from.id },
+                  message: { text: fullMessage },
+                  access_token: validToken,
+                }),
+              })
 
               if (!response.ok) {
                 const errorData = await response.json()
@@ -445,21 +444,21 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
                 sentAt: new Date(),
               })
 
-              messageResult = { success: true, method: "dm" }
+              messageResult = { success: true, method: "direct_message" }
             } catch (fallbackError) {
               throw fallbackError
             }
           }
         } else {
-          // Send direct message with fallback
+          // Send direct message
           let fullMessage = automation.message || "Thank you for your comment!"
 
           if (automation.addBranding) {
             fullMessage += `\n\n${automation.brandingMessage || "⚡ Sent via ChatAutoDM — grow your DMs on autopilot"}`
           }
 
-          // Use Facebook Graph API to send message
-          const response = await fetch(`https://graph.facebook.com/v18.0/${instagramAccount.instagramId}/messages`, {
+          // Use Instagram Graph API to send message
+          const response = await fetch(`https://graph.instagram.com/${instagramAccount.instagramId}/messages`, {
             method: "POST",
             headers: {
               "Content-Type": "application/json",
@@ -489,7 +488,7 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
             sentAt: new Date(),
           })
 
-          messageResult = { success: true, method: "dm" }
+          messageResult = { success: true, method: "direct_message" }
         }
 
         messagesSent++
@@ -545,7 +544,7 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
   }
 }
 
-// Process a button click
+// Process a button click (quick reply)
 async function processButtonClick(data) {
   try {
     const { automationId, senderId, recipientId } = data
@@ -587,9 +586,9 @@ async function processButtonClick(data) {
     // Get username from ID
     let username = "user"
     try {
-      const token = instagramAccount.pageAccessToken || instagramAccount.accessToken
+      const token = instagramAccount.accessToken
       const userResponse = await fetch(
-        `https://graph.facebook.com/v18.0/${senderId}?fields=username&access_token=${token}`,
+        `https://graph.instagram.com/${senderId}?fields=username&access_token=${token}`,
         { cache: "no-store" },
       )
       if (userResponse.ok) {
@@ -600,8 +599,8 @@ async function processButtonClick(data) {
       console.error("Error getting username:", error)
     }
 
-    // Send the DM using Facebook Graph API
-    const dmResponse = await fetch(`https://graph.facebook.com/v18.0/${instagramAccount.instagramId}/messages`, {
+    // Send the DM using Instagram Graph API
+    const dmResponse = await fetch(`https://graph.instagram.com/${instagramAccount.instagramId}/messages`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -609,7 +608,7 @@ async function processButtonClick(data) {
       body: JSON.stringify({
         recipient: { id: senderId },
         message: { text: fullMessage },
-        access_token: instagramAccount.pageAccessToken || instagramAccount.accessToken,
+        access_token: instagramAccount.accessToken,
       }),
     })
 
@@ -666,42 +665,12 @@ async function processMessage(messageData) {
     })
 
     // Find the Instagram account by recipient ID
-    // First try exact match on instagramId
-    let instagramAccount = await db.collection("instagramAccounts").findOne({
+    const instagramAccount = await db.collection("instagramAccounts").findOne({
       instagramId: recipient.id,
     })
 
-    // If not found, try to find by pageId
     if (!instagramAccount) {
-      instagramAccount = await db.collection("instagramAccounts").findOne({
-        pageId: recipient.id,
-      })
-    }
-
-    // If still not found, try to find by any field that might contain the ID
-    if (!instagramAccount) {
-      // Log all accounts for debugging
-      const allAccounts = await db.collection("instagramAccounts").find({}).toArray()
-      console.log(
-        "All Instagram accounts:",
-        JSON.stringify(
-          allAccounts.map((a) => ({
-            _id: a._id,
-            username: a.username,
-            instagramId: a.instagramId,
-            pageId: a.pageId,
-          })),
-        ),
-      )
-
-      // Try to find by any field that might contain the ID
-      instagramAccount = await db.collection("instagramAccounts").findOne({
-        $or: [{ instagramBusinessId: recipient.id }, { businessId: recipient.id }, { igBusinessId: recipient.id }],
-      })
-    }
-
-    if (!instagramAccount) {
-      console.log(`Instagram account with ID ${recipient.id} not found`)
+      console.log(`No Instagram account found for recipient ID: ${recipient.id}`)
       return {
         success: false,
         message: `Instagram account with ID ${recipient.id} not found`,
@@ -710,35 +679,32 @@ async function processMessage(messageData) {
 
     console.log(`Found Instagram account: ${instagramAccount.username} for recipient ID: ${recipient.id}`)
 
-    // Store the message in the database with high priority
+    // Store the message
     const messageId = new ObjectId().toString()
     await db.collection("incomingMessages").insertOne({
       _id: messageId,
+      instagramAccountId: instagramAccount._id,
       senderId: sender.id,
       senderUsername: sender.username || "unknown",
-      recipientId: recipient.id,
-      instagramAccountId: instagramAccount._id,
       message: message?.text || "",
       timestamp: new Date(timestamp || Date.now()),
-      createdAt: new Date(),
-      highPriority: true,
       processed: false,
     })
 
-    // Find or create contact with improved error handling
+    // Find or create contact
     let contact = await db.collection("contacts").findOne({
       instagramAccountId: instagramAccount._id,
       senderId: sender.id,
     })
 
     if (!contact) {
-      // Try to get username from Facebook Graph API with better error handling
+      // Try to get username from Instagram Graph API
       let username = sender.username || "unknown"
       try {
-        const token = instagramAccount.pageAccessToken || instagramAccount.accessToken
+        const token = instagramAccount.accessToken
         if (token && !token.includes("undefined") && !token.includes("null")) {
           const userResponse = await fetch(
-            `https://graph.facebook.com/v18.0/${sender.id}?fields=username&access_token=${token}`,
+            `https://graph.instagram.com/${sender.id}?fields=username&access_token=${token}`,
             {
               cache: "no-store",
               timeout: 5000, // 5 second timeout
@@ -798,7 +764,7 @@ async function processMessage(messageData) {
       read: false,
     })
 
-    // Check for automated responses based on message content
+    // Check for message automations
     const automations = await db
       .collection("automations")
       .find({
@@ -860,23 +826,20 @@ async function processMessage(messageData) {
 
           for (let attempt = 1; attempt <= 3; attempt++) {
             try {
-              // Send the DM directly using the Facebook Graph API
-              const token = instagramAccount.pageAccessToken || instagramAccount.accessToken
-              const dmResponse = await fetch(
-                `https://graph.facebook.com/v18.0/${instagramAccount.instagramId}/messages`,
-                {
-                  method: "POST",
-                  headers: {
-                    "Content-Type": "application/json",
-                  },
-                  body: JSON.stringify({
-                    recipient: { id: sender.id },
-                    message: { text: responseMessage },
-                    access_token: token,
-                  }),
-                  cache: "no-store",
+              // Send the DM directly using the Instagram Graph API
+              const token = instagramAccount.accessToken
+              const dmResponse = await fetch(`https://graph.instagram.com/${instagramAccount.instagramId}/messages`, {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
                 },
-              )
+                body: JSON.stringify({
+                  recipient: { id: sender.id },
+                  message: { text: responseMessage },
+                  access_token: token,
+                }),
+                cache: "no-store",
+              })
 
               if (!dmResponse.ok) {
                 const errorData = await dmResponse.json()
@@ -989,8 +952,9 @@ async function replyToComment(accessToken, commentId, replyText) {
       throw new Error("Invalid access token format")
     }
 
+    // Use graph.instagram.com instead of graph.facebook.com
     const response = await fetch(
-      `https://graph.facebook.com/v18.0/${commentId}/replies?message=${encodeURIComponent(replyText)}&access_token=${accessToken}`,
+      `https://graph.instagram.com/${commentId}/replies?message=${encodeURIComponent(replyText)}&access_token=${accessToken}`,
       {
         method: "POST",
         headers: {
@@ -1011,583 +975,36 @@ async function replyToComment(accessToken, commentId, replyText) {
   }
 }
 
-// Send a direct message
-async function sendDirectMessage(accessToken, instagramAccountId, recipientUsername, message) {
+// Send a private reply to a comment
+async function sendPrivateReply(accessToken, instagramId, commentId, message) {
   try {
     // Validate token
     if (!accessToken || accessToken.includes("undefined") || accessToken.includes("null")) {
       throw new Error("Invalid access token format")
     }
 
-    let recipientId = null
-
-    // Try multiple approaches to get the user ID
-    try {
-      // First try the username search endpoint
-      const userSearchResponse = await fetch(
-        `https://graph.facebook.com/v18.0/ig_username_search?q=${recipientUsername}&access_token=${accessToken}`,
-        { cache: "no-store" },
-      )
-
-      if (userSearchResponse.ok) {
-        const userSearchData = await userSearchResponse.json()
-        if (userSearchData.data && userSearchData.data.length > 0) {
-          recipientId = userSearchData.data[0].id
-        }
-      } else {
-        console.log(`Username search failed for ${recipientUsername}, trying alternative method`)
-      }
-    } catch (searchError) {
-      console.error(`Error searching for username ${recipientUsername}:`, searchError)
-    }
-
-    // If username search failed, try business discovery
-    if (!recipientId) {
-      try {
-        const businessDiscoveryResponse = await fetch(
-          `https://graph.facebook.com/v18.0/${instagramAccountId}?fields=business_discovery.username(${recipientUsername})&access_token=${accessToken}`,
-          { cache: "no-store" },
-        )
-
-        if (businessDiscoveryResponse.ok) {
-          const businessData = await businessDiscoveryResponse.json()
-          if (businessData.business_discovery && businessData.business_discovery.id) {
-            recipientId = businessData.business_discovery.id
-          }
-        }
-      } catch (businessError) {
-        console.error(`Error using business discovery for ${recipientUsername}:`, businessError)
-      }
-    }
-
-    // If we still don't have a recipient ID, try one more approach
-    if (!recipientId) {
-      try {
-        // Try to get user info from mentions
-        const mentionsResponse = await fetch(
-          `https://graph.facebook.com/v18.0/${instagramAccountId}/mentions?access_token=${accessToken}`,
-          { cache: "no-store" },
-        )
-
-        if (mentionsResponse.ok) {
-          const mentionsData = await mentionsResponse.json()
-          const mention = mentionsData.data?.find((m) => m.username?.toLowerCase() === recipientUsername.toLowerCase())
-
-          if (mention && mention.id) {
-            recipientId = mention.id
-          }
-        }
-      } catch (mentionsError) {
-        console.error(`Error with mentions approach for ${recipientUsername}:`, mentionsError)
-      }
-    }
-
-    // If we still don't have a recipient ID, throw an error
-    if (!recipientId) {
-      throw new Error(`Could not find Instagram user ID for @${recipientUsername}`)
-    }
-
-    // Now send the DM using the Instagram Graph API
-    const dmResponse = await fetch(`https://graph.facebook.com/v18.0/${instagramAccountId}/messages`, {
+    // Use graph.instagram.com as per the documentation
+    const response = await fetch(`https://graph.instagram.com/${instagramId}/messages`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        recipient: { id: recipientId },
+        recipient: { comment_id: commentId },
         message: { text: message },
         access_token: accessToken,
       }),
-      cache: "no-store",
     })
-
-    if (!dmResponse.ok) {
-      const errorData = await dmResponse.json()
-      throw new Error(`Failed to send direct message: ${JSON.stringify(errorData)}`)
-    }
-
-    return await dmResponse.json()
-  } catch (error) {
-    console.error("Error sending direct message:", error)
-    throw error
-  }
-}
-
-// Send a direct message with a button
-async function sendDirectMessageWithButton(
-  accessToken,
-  instagramAccountId,
-  recipientUsername,
-  message,
-  buttonText,
-  automationId,
-) {
-  try {
-    // Validate token
-    if (!accessToken || accessToken.includes("undefined") || accessToken.includes("null")) {
-      throw new Error("Invalid access token format")
-    }
-
-    let recipientId = null
-
-    // Try multiple approaches to get the user ID
-    try {
-      // First try the username search endpoint
-      const userSearchResponse = await fetch(
-        `https://graph.facebook.com/v18.0/ig_username_search?q=${recipientUsername}&access_token=${accessToken}`,
-        { cache: "no-store" },
-      )
-
-      if (userSearchResponse.ok) {
-        const userSearchData = await userSearchResponse.json()
-        if (userSearchData.data && userSearchData.data.length > 0) {
-          recipientId = userSearchData.data[0].id
-        }
-      } else {
-        console.log(`Username search failed for ${recipientUsername}, trying alternative method`)
-      }
-    } catch (searchError) {
-      console.error(`Error searching for username ${recipientUsername}:`, searchError)
-    }
-
-    // If username search failed, try business discovery
-    if (!recipientId) {
-      try {
-        const businessDiscoveryResponse = await fetch(
-          `https://graph.facebook.com/v18.0/${instagramAccountId}?fields=business_discovery.username(${recipientUsername})&access_token=${accessToken}`,
-          { cache: "no-store" },
-        )
-
-        if (businessDiscoveryResponse.ok) {
-          const businessData = await businessDiscoveryResponse.json()
-          if (businessData.business_discovery && businessData.business_discovery.id) {
-            recipientId = businessData.business_discovery.id
-          }
-        }
-      } catch (businessError) {
-        console.error(`Error using business discovery for ${recipientUsername}:`, businessError)
-      }
-    }
-
-    // If we still don't have a recipient ID, try one more approach
-    if (!recipientId) {
-      try {
-        // Try to get user info from mentions
-        const mentionsResponse = await fetch(
-          `https://graph.facebook.com/v18.0/${instagramAccountId}/mentions?access_token=${accessToken}`,
-          { cache: "no-store" },
-        )
-
-        if (mentionsResponse.ok) {
-          const mentionsData = await mentionsResponse.json()
-          const mention = mentionsData.data?.find((m) => m.username?.toLowerCase() === recipientUsername.toLowerCase())
-
-          if (mention && mention.id) {
-            recipientId = mention.id
-          }
-        }
-      } catch (mentionsError) {
-        console.error(`Error with mentions approach for ${recipientUsername}:`, mentionsError)
-      }
-    }
-
-    // If we still don't have a recipient ID, throw an error
-    if (!recipientId) {
-      throw new Error(`Could not find Instagram user ID for @${recipientUsername}`)
-    }
-
-    // Now send the DM with button using the Instagram Graph API
-    const dmResponse = await fetch(`https://graph.facebook.com/v18.0/${instagramAccountId}/messages`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        recipient: { id: recipientId },
-        message: {
-          text: message,
-          quick_replies: [
-            {
-              content_type: "text",
-              title: buttonText,
-              payload: `SEND_CONTENT_${automationId}`,
-            },
-          ],
-        },
-        access_token: accessToken,
-      }),
-      cache: "no-store",
-    })
-
-    if (!dmResponse.ok) {
-      const errorData = await dmResponse.json()
-      throw new Error(`Failed to send direct message: ${JSON.stringify(errorData)}`)
-    }
-
-    return await dmResponse.json()
-  } catch (error) {
-    console.error("Error sending direct message with button:", error)
-    throw error
-  }
-}
-
-// Send a direct message with fallback to comment reply
-async function sendDirectMessageWithFallback(
-  accessToken,
-  instagramAccountId,
-  recipientUsername,
-  message,
-  commentId = null,
-) {
-  try {
-    // Validate token
-    if (!accessToken || accessToken.includes("undefined") || accessToken.includes("null")) {
-      throw new Error("Invalid access token format")
-    }
-
-    let recipientId = null
-
-    // Try multiple approaches to get the user ID
-    try {
-      // First try the username search endpoint
-      const userSearchResponse = await fetch(
-        `https://graph.facebook.com/v18.0/ig_username_search?q=${recipientUsername}&access_token=${accessToken}`,
-        { cache: "no-store" },
-      )
-
-      if (userSearchResponse.ok) {
-        const userSearchData = await userSearchResponse.json()
-        if (userSearchData.data && userSearchData.data.length > 0) {
-          recipientId = userSearchData.data[0].id
-        }
-      } else {
-        console.log(`Username search failed for ${recipientUsername}, trying alternative method`)
-      }
-    } catch (searchError) {
-      console.error(`Error searching for username ${recipientUsername}:`, searchError)
-    }
-
-    // If username search failed, try business discovery
-    if (!recipientId) {
-      try {
-        const businessDiscoveryResponse = await fetch(
-          `https://graph.facebook.com/v18.0/${instagramAccountId}?fields=business_discovery.username(${recipientUsername})&access_token=${accessToken}`,
-          { cache: "no-store" },
-        )
-
-        if (businessDiscoveryResponse.ok) {
-          const businessData = await businessDiscoveryResponse.json()
-          if (businessData.business_discovery && businessData.business_discovery.id) {
-            recipientId = businessData.business_discovery.id
-          }
-        }
-      } catch (businessError) {
-        console.error(`Error using business discovery for ${recipientUsername}:`, businessError)
-      }
-    }
-
-    // If we still don't have a recipient ID, try one more approach
-    if (!recipientId) {
-      try {
-        // Try to get user info from mentions
-        const mentionsResponse = await fetch(
-          `https://graph.facebook.com/v18.0/${instagramAccountId}/mentions?access_token=${accessToken}`,
-          { cache: "no-store" },
-        )
-
-        if (mentionsResponse.ok) {
-          const mentionsData = await mentionsResponse.json()
-          const mention = mentionsData.data?.find((m) => m.username?.toLowerCase() === recipientUsername.toLowerCase())
-
-          if (mention && mention.id) {
-            recipientId = mention.id
-          }
-        }
-      } catch (mentionsError) {
-        console.error(`Error with mentions approach for ${recipientUsername}:`, mentionsError)
-      }
-    }
-
-    // If we still don't have a recipient ID, try direct ID approach
-    if (!recipientId && /^\d+$/.test(recipientUsername)) {
-      // If the username is all digits, try using it directly as an ID
-      recipientId = recipientUsername
-    }
-
-    // If we have a recipient ID, try to send the DM
-    if (recipientId) {
-      try {
-        // Now send the DM using the Instagram Graph API
-        const dmResponse = await fetch(`https://graph.facebook.com/v18.0/${instagramAccountId}/messages`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            recipient: { id: recipientId },
-            message: { text: message },
-            access_token: accessToken,
-          }),
-          cache: "no-store",
-        })
-
-        if (dmResponse.ok) {
-          return {
-            success: true,
-            method: "dm",
-            response: await dmResponse.json(),
-          }
-        } else {
-          const errorData = await dmResponse.json()
-          console.error(`DM API error: ${JSON.stringify(errorData)}`)
-          throw new Error(`Failed to send direct message: ${JSON.stringify(errorData)}`)
-        }
-      } catch (dmError) {
-        console.error(`Error sending DM to ${recipientUsername}:`, dmError)
-
-        // If we have a comment ID, try to reply to the comment as fallback
-        if (commentId) {
-          return await replyToCommentWithFallback(accessToken, commentId, message)
-        } else {
-          throw dmError
-        }
-      }
-    } else if (commentId) {
-      // If we couldn't get a recipient ID but have a comment ID, use comment reply as fallback
-      return await replyToCommentWithFallback(accessToken, commentId, message)
-    } else {
-      throw new Error(`Could not find Instagram user ID for @${recipientUsername}`)
-    }
-  } catch (error) {
-    console.error("Error in sendDirectMessageWithFallback:", error)
-    throw error
-  }
-}
-
-// Reply to a comment with fallback message
-async function replyToCommentWithFallback(accessToken, commentId, message) {
-  try {
-    // Validate token
-    if (!accessToken || accessToken.includes("undefined") || accessToken.includes("null")) {
-      throw new Error("Invalid access token format")
-    }
-
-    // Format the message for a comment (shorter, no formatting)
-    let commentMessage = message
-
-    // Truncate if too long
-    if (commentMessage.length > 300) {
-      commentMessage = commentMessage.substring(0, 297) + "..."
-    }
-
-    // Remove any branding or formatting that wouldn't work well in comments
-    commentMessage = commentMessage.replace(/⚡ Sent via ChatAutoDM.*$/m, "")
-
-    const response = await fetch(
-      `https://graph.facebook.com/v18.0/${commentId}/replies?message=${encodeURIComponent(commentMessage)}&access_token=${accessToken}`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-      },
-    )
 
     if (!response.ok) {
       const errorData = await response.json()
-      throw new Error(`Failed to reply to comment: ${JSON.stringify(errorData)}`)
+      throw new Error(`Failed to send private reply: ${JSON.stringify(errorData)}`)
     }
 
-    return {
-      success: true,
-      method: "comment_reply",
-      response: await response.json(),
-    }
+    return await response.json()
   } catch (error) {
-    console.error("Error replying to comment with fallback:", error)
+    console.error("Error sending private reply:", error)
     throw error
-  }
-}
-
-// Scheduled job to check for comments
-async function checkForComments() {
-  try {
-    console.log("Running scheduled job to check for comments")
-
-    // Get all active automations
-    const automations = await db
-      .collection("automations")
-      .find({
-        active: true,
-        type: "comment", // Only get comment automations
-      })
-      .toArray()
-
-    console.log(`Found ${automations.length} active comment automations`)
-
-    let totalProcessed = 0
-    const totalSent = 0
-
-    for (const automation of automations) {
-      try {
-        // Get the Instagram account
-        const instagramAccount = await db.collection("instagramAccounts").findOne({
-          _id: automation.instagramAccountId,
-        })
-
-        if (!instagramAccount) {
-          console.log(`Instagram account ${automation.instagramAccountId} not found for automation ${automation._id}`)
-          continue
-        }
-
-        // Validate token before using
-        if (
-          !instagramAccount.accessToken ||
-          instagramAccount.accessToken.includes("undefined") ||
-          instagramAccount.accessToken.includes("null")
-        ) {
-          console.log(`Invalid token format for account ${instagramAccount.username}, skipping automation`)
-          continue
-        }
-
-        // Get a valid token
-        const validToken = instagramAccount.pageAccessToken || instagramAccount.accessToken
-
-        if (!validToken) {
-          console.log(`No valid token for Instagram account ${instagramAccount.username}`)
-          continue
-        }
-
-        // For "any post" automations, check all posts from this account
-        if (!automation.postId) {
-          console.log(`Processing "any post" automation ${automation._id}`)
-
-          // Get all posts for this account
-          const posts = await db.collection("posts").find({ instagramAccountId: instagramAccount._id }).toArray()
-
-          console.log(`Found ${posts.length} posts for account ${instagramAccount._id}`)
-
-          // If no posts found, try to fetch them from Instagram
-          if (posts.length === 0) {
-            try {
-              console.log(`Fetching posts for account ${instagramAccount.username}`)
-              const response = await fetch(
-                `https://graph.facebook.com/v18.0/${instagramAccount.instagramId}/media?fields=id,caption,permalink&access_token=${validToken}&limit=10`,
-                { cache: "no-store" },
-              )
-
-              if (response.ok) {
-                const data = await response.json()
-                console.log(`Fetched ${data.data?.length || 0} posts from Instagram API`)
-
-                if (data.data && data.data.length > 0) {
-                  for (const postData of data.data) {
-                    // Create a new post
-                    const newPost = {
-                      _id: new ObjectId().toString(),
-                      instagramAccountId: instagramAccount._id,
-                      instagramId: postData.id,
-                      caption: postData.caption || "",
-                      permalink: postData.permalink || "",
-                      createdAt: new Date(),
-                      updatedAt: new Date(),
-                    }
-
-                    await db.collection("posts").insertOne(newPost)
-                    console.log(`Created new post for media ${postData.id}`)
-
-                    // Process comments for this post
-                    await processPostComments(validToken, newPost, automation, instagramAccount)
-                    totalProcessed++
-                  }
-                }
-              } else {
-                const errorData = await response.json()
-                console.error(`Error fetching posts: ${JSON.stringify(errorData)}`)
-              }
-            } catch (error) {
-              console.error(`Error fetching posts for account ${instagramAccount._id}:`, error)
-            }
-          } else {
-            // Process existing posts
-            for (const post of posts) {
-              await processPostComments(validToken, post, automation, instagramAccount)
-              totalProcessed++
-            }
-          }
-
-          continue
-        }
-
-        // Get the post
-        const post = await db.collection("posts").findOne({
-          _id: automation.postId,
-        })
-
-        if (!post) {
-          console.log(`Post ${automation.postId} not found for automation ${automation._id}`)
-          continue
-        }
-
-        await processPostComments(validToken, post, automation, instagramAccount)
-        totalProcessed++
-
-        // Update the last checked time
-        await db.collection("automations").updateOne({ _id: automation._id }, { $set: { lastChecked: new Date() } })
-      } catch (error) {
-        console.error(`Error processing automation ${automation._id}:`, error)
-      }
-    }
-
-    console.log(`Finished checking for comments. Processed ${totalProcessed} posts, sent ${totalSent} messages.`)
-  } catch (error) {
-    console.error("Error checking for comments:", error)
-  }
-}
-
-// Process comments for a post
-async function processPostComments(accessToken, post, automation, instagramAccount) {
-  try {
-    // Validate token before using
-    if (!accessToken || accessToken.includes("undefined") || accessToken.includes("null")) {
-      console.log(`Invalid token format for post ${post.instagramId}, skipping`)
-      return
-    }
-
-    // Get the last check time
-    const lastChecked = automation.lastChecked || new Date(0)
-
-    // Get comments for this post
-    const comments = await getPostComments(accessToken, post.instagramId, lastChecked.toISOString())
-
-    console.log(`Found ${comments.length} comments for post ${post.instagramId}`)
-
-    // Process each comment
-    for (const comment of comments) {
-      try {
-        // Check if we've already processed this comment
-        const existingComment = await db.collection("comments").findOne({ commentId: comment.id })
-
-        if (existingComment && existingComment.processed) {
-          continue
-        }
-
-        // Process the comment
-        await processComment({
-          id: comment.id,
-          text: comment.text || "",
-          media_id: post.instagramId,
-          from: {
-            id: comment.from?.id || "unknown",
-            username: comment.from?.username || comment.username || "unknown",
-          },
-        })
-      } catch (commentError) {
-        console.error(`Error processing comment ${comment.id}:`, commentError)
-      }
-    }
-  } catch (error) {
-    console.error(`Error processing post comments for post ${post.instagramId}:`, error)
   }
 }
 
@@ -1599,7 +1016,8 @@ async function getPostComments(accessToken, postId, since) {
       throw new Error("Invalid access token format")
     }
 
-    const url = `https://graph.facebook.com/v18.0/${postId}/comments?fields=id,text,username,timestamp,from&access_token=${accessToken}&limit=50${since ? `&since=${since}` : ""}`
+    // Use graph.instagram.com as per the documentation
+    const url = `https://graph.instagram.com/${postId}/comments?fields=id,text,username,timestamp,from&access_token=${accessToken}&limit=50${since ? `&since=${since}` : ""}`
 
     const response = await fetch(url, { cache: "no-store" })
 
@@ -1621,182 +1039,6 @@ async function getPostComments(accessToken, postId, since) {
   } catch (error) {
     console.error("Error fetching post comments:", error)
     return []
-  }
-}
-
-// Scheduled job to refresh tokens
-async function refreshTokens() {
-  try {
-    console.log("Running scheduled job to refresh tokens")
-
-    // Get all Instagram accounts
-    const accounts = await db.collection("instagramAccounts").find({}).toArray()
-
-    console.log(`Found ${accounts.length} Instagram accounts`)
-
-    for (const account of accounts) {
-      try {
-        // Skip accounts with invalid token format
-        if (!account.accessToken || account.accessToken.includes("undefined") || account.accessToken.includes("null")) {
-          console.log(`Invalid token format for account ${account.username}, marking for reconnection`)
-
-          // Mark the account as needing reconnection
-          await db.collection("instagramAccounts").updateOne(
-            { _id: account._id },
-            {
-              $set: {
-                tokenError: "Invalid token format",
-                tokenErrorAt: new Date(),
-                needsReconnection: true,
-              },
-            },
-          )
-          continue
-        }
-
-        // Check if token is expired or will expire soon (within 7 days)
-        const now = new Date()
-        const expiryDate = account.expiresAt ? new Date(account.expiresAt) : null
-        const sevenDaysFromNow = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000)
-
-        // If token doesn't expire or expiry is more than 7 days away, skip
-        if (!expiryDate || expiryDate > sevenDaysFromNow) {
-          continue
-        }
-
-        console.log(`Refreshing token for Instagram account: ${account.username} (expires: ${expiryDate})`)
-
-        // Refresh the long-lived token
-        const response = await fetch(
-          `https://graph.instagram.com/refresh_access_token?grant_type=ig_refresh_token&access_token=${account.accessToken}`,
-          { cache: "no-store" },
-        )
-
-        if (!response.ok) {
-          const errorData = await response.json()
-          console.error(`Failed to refresh token for ${account.username}:`, errorData)
-
-          // Log the error
-          await db.collection("tokenRefreshErrors").insertOne({
-            accountId: account._id,
-            username: account.username,
-            error: errorData,
-            timestamp: new Date(),
-          })
-
-          // Mark the account as needing reconnection
-          await db.collection("instagramAccounts").updateOne(
-            { _id: account._id },
-            {
-              $set: {
-                tokenError: "Failed to refresh token automatically",
-                tokenErrorAt: new Date(),
-                needsReconnection: true,
-              },
-            },
-          )
-
-          continue
-        }
-
-        const data = await response.json()
-
-        // Calculate new expiry date
-        const newExpiryDate = new Date()
-        newExpiryDate.setSeconds(newExpiryDate.getSeconds() + data.expires_in)
-
-        // Update the account with new token and expiry
-        await db.collection("instagramAccounts").updateOne(
-          { _id: account._id },
-          {
-            $set: {
-              accessToken: data.access_token,
-              expiresAt: newExpiryDate,
-              lastTokenRefresh: new Date(),
-              needsReconnection: false,
-              tokenError: null,
-              tokenErrorAt: null,
-            },
-          },
-        )
-
-        console.log(`Successfully refreshed token for ${account.username}, new expiry: ${newExpiryDate}`)
-
-        // Also update page access token if available
-        if (account.pageId && account.pageAccessToken) {
-          try {
-            const pageTokenResponse = await fetch(
-              `https://graph.facebook.com/${account.pageId}?fields=access_token&access_token=${data.access_token}`,
-              { cache: "no-store" },
-            )
-
-            if (pageTokenResponse.ok) {
-              const pageData = await pageTokenResponse.json()
-
-              if (pageData.access_token) {
-                await db.collection("instagramAccounts").updateOne(
-                  { _id: account._id },
-                  {
-                    $set: {
-                      pageAccessToken: pageData.access_token,
-                    },
-                  },
-                )
-
-                console.log(`Updated page access token for ${account.username}`)
-
-                // Re-subscribe to webhooks with the new token
-                try {
-                  await subscribeToWebhooks(account.pageId, pageData.access_token)
-                  console.log(`Re-subscribed to webhooks for ${account.username}`)
-                } catch (webhookError) {
-                  console.error(`Error re-subscribing to webhooks for ${account.username}:`, webhookError)
-                }
-              }
-            }
-          } catch (error) {
-            console.error(`Error refreshing page token for ${account.username}:`, error)
-          }
-        }
-      } catch (error) {
-        console.error(`Error processing account ${account.username}:`, error)
-      }
-    }
-
-    console.log("Finished refreshing tokens")
-  } catch (error) {
-    console.error("Error refreshing tokens:", error)
-  }
-}
-
-// Function to subscribe to webhooks
-async function subscribeToWebhooks(pageId, pageAccessToken) {
-  try {
-    const webhookUrl = `${process.env.NEXT_PUBLIC_APP_URL}/api/webhooks/instagram`
-
-    // Subscribe to Instagram comments and messages
-    const response = await fetch(`https://graph.facebook.com/v18.0/${pageId}/subscribed_apps`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        subscribed_fields: ["feed", "comments", "messages"],
-        callback_url: webhookUrl,
-        verify_token: process.env.WEBHOOK_VERIFY_TOKEN,
-        access_token: pageAccessToken,
-      }),
-    })
-
-    if (!response.ok) {
-      const errorData = await response.json()
-      throw new Error(`Failed to subscribe to webhooks: ${JSON.stringify(errorData)}`)
-    }
-
-    return await response.json()
-  } catch (error) {
-    console.error("Error subscribing to webhooks:", error)
-    throw error
   }
 }
 
@@ -1869,12 +1111,308 @@ function scheduleJobs() {
   }, 60 * 1000)
 
   // Check for comments every 5 minutes
-  setInterval(checkForComments, 1 * 60 * 1000)
+  setInterval(
+    async () => {
+      try {
+        console.log("Running scheduled job to check for comments")
+
+        // Get all active automations
+        const automations = await db
+          .collection("automations")
+          .find({
+            active: true,
+            type: "comment", // Only get comment automations
+          })
+          .toArray()
+
+        console.log(`Found ${automations.length} active comment automations`)
+
+        let totalProcessed = 0
+
+        for (const automation of automations) {
+          try {
+            // Get the Instagram account
+            const instagramAccount = await db.collection("instagramAccounts").findOne({
+              _id: automation.instagramAccountId,
+            })
+
+            if (!instagramAccount) {
+              console.log(
+                `Instagram account ${automation.instagramAccountId} not found for automation ${automation._id}`,
+              )
+              continue
+            }
+
+            // Validate token before using
+            if (
+              !instagramAccount.accessToken ||
+              instagramAccount.accessToken.includes("undefined") ||
+              instagramAccount.accessToken.includes("null")
+            ) {
+              console.log(`Invalid token format for account ${instagramAccount.username}, skipping automation`)
+              continue
+            }
+
+            // Get a valid token
+            const validToken = instagramAccount.accessToken
+
+            if (!validToken) {
+              console.log(`No valid token for Instagram account ${instagramAccount.username}`)
+              continue
+            }
+
+            // For "any post" automations, check all posts from this account
+            if (!automation.postId) {
+              console.log(`Processing "any post" automation ${automation._id}`)
+
+              // Get all posts for this account
+              const posts = await db.collection("posts").find({ instagramAccountId: instagramAccount._id }).toArray()
+
+              console.log(`Found ${posts.length} posts for account ${instagramAccount._id}`)
+
+              // If no posts found, try to fetch them from Instagram
+              if (posts.length === 0) {
+                try {
+                  console.log(`Fetching posts for account ${instagramAccount.username}`)
+                  // Use graph.instagram.com as per the documentation
+                  const response = await fetch(
+                    `https://graph.instagram.com/me/media?fields=id,caption,permalink&access_token=${validToken}&limit=10`,
+                    { cache: "no-store" },
+                  )
+
+                  if (response.ok) {
+                    const data = await response.json()
+                    console.log(`Fetched ${data.data?.length || 0} posts from Instagram API`)
+
+                    if (data.data && data.data.length > 0) {
+                      for (const postData of data.data) {
+                        // Create a new post
+                        const newPost = {
+                          _id: new ObjectId().toString(),
+                          instagramAccountId: instagramAccount._id,
+                          instagramId: postData.id,
+                          caption: postData.caption || "",
+                          permalink: postData.permalink || "",
+                          createdAt: new Date(),
+                          updatedAt: new Date(),
+                        }
+
+                        await db.collection("posts").insertOne(newPost)
+                        console.log(`Created new post for media ${postData.id}`)
+
+                        // Process comments for this post
+                        await processPostComments(validToken, newPost, automation, instagramAccount)
+                        totalProcessed++
+                      }
+                    }
+                  } else {
+                    const errorData = await response.json()
+                    console.error(`Error fetching posts: ${JSON.stringify(errorData)}`)
+                  }
+                } catch (error) {
+                  console.error(`Error fetching posts for account ${instagramAccount._id}:`, error)
+                }
+              } else {
+                // Process existing posts
+                for (const post of posts) {
+                  await processPostComments(validToken, post, automation, instagramAccount)
+                  totalProcessed++
+                }
+              }
+
+              continue
+            }
+
+            // Get the post
+            const post = await db.collection("posts").findOne({
+              _id: automation.postId,
+            })
+
+            if (!post) {
+              console.log(`Post ${automation.postId} not found for automation ${automation._id}`)
+              continue
+            }
+
+            await processPostComments(validToken, post, automation, instagramAccount)
+            totalProcessed++
+
+            // Update the last checked time
+            await db.collection("automations").updateOne({ _id: automation._id }, { $set: { lastChecked: new Date() } })
+          } catch (error) {
+            console.error(`Error processing automation ${automation._id}:`, error)
+          }
+        }
+
+        console.log(`Finished checking for comments. Processed ${totalProcessed} posts.`)
+      } catch (error) {
+        console.error("Error checking for comments:", error)
+      }
+    },
+    5 * 60 * 1000,
+  )
 
   // Refresh tokens every 24 hours
-  setInterval(refreshTokens, 24 * 60 * 60 * 1000)
+  setInterval(
+    async () => {
+      try {
+        console.log("Running scheduled job to refresh tokens")
+
+        // Get all Instagram accounts
+        const accounts = await db.collection("instagramAccounts").find({}).toArray()
+
+        console.log(`Found ${accounts.length} Instagram accounts`)
+
+        for (const account of accounts) {
+          try {
+            // Skip accounts with invalid token format
+            if (
+              !account.accessToken ||
+              account.accessToken.includes("undefined") ||
+              account.accessToken.includes("null")
+            ) {
+              console.log(`Invalid token format for account ${account.username}, marking for reconnection`)
+
+              // Mark the account as needing reconnection
+              await db.collection("instagramAccounts").updateOne(
+                { _id: account._id },
+                {
+                  $set: {
+                    tokenError: "Invalid token format",
+                    tokenErrorAt: new Date(),
+                    needsReconnection: true,
+                  },
+                },
+              )
+              continue
+            }
+
+            // Check if token is expired or will expire soon (within 7 days)
+            const now = new Date()
+            const expiryDate = account.expiresAt ? new Date(account.expiresAt) : null
+            const sevenDaysFromNow = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000)
+
+            // If token doesn't expire or expiry is more than 7 days away, skip
+            if (!expiryDate || expiryDate > sevenDaysFromNow) {
+              continue
+            }
+
+            console.log(`Refreshing token for Instagram account: ${account.username} (expires: ${expiryDate})`)
+
+            // Refresh the long-lived token using graph.instagram.com
+            const response = await fetch(
+              `https://graph.instagram.com/refresh_access_token?grant_type=ig_refresh_token&access_token=${account.accessToken}`,
+              { cache: "no-store" },
+            )
+
+            if (!response.ok) {
+              const errorData = await response.json()
+              console.error(`Failed to refresh token for ${account.username}:`, errorData)
+
+              // Log the error
+              await db.collection("tokenRefreshErrors").insertOne({
+                accountId: account._id,
+                username: account.username,
+                error: errorData,
+                timestamp: new Date(),
+              })
+
+              // Mark the account as needing reconnection
+              await db.collection("instagramAccounts").updateOne(
+                { _id: account._id },
+                {
+                  $set: {
+                    tokenError: "Failed to refresh token automatically",
+                    tokenErrorAt: new Date(),
+                    needsReconnection: true,
+                  },
+                },
+              )
+
+              continue
+            }
+
+            const data = await response.json()
+
+            // Calculate new expiry date
+            const newExpiryDate = new Date()
+            newExpiryDate.setSeconds(newExpiryDate.getSeconds() + data.expires_in)
+
+            // Update the account with new token and expiry
+            await db.collection("instagramAccounts").updateOne(
+              { _id: account._id },
+              {
+                $set: {
+                  accessToken: data.access_token,
+                  expiresAt: newExpiryDate,
+                  lastTokenRefresh: new Date(),
+                  needsReconnection: false,
+                  tokenError: null,
+                  tokenErrorAt: null,
+                },
+              },
+            )
+
+            console.log(`Successfully refreshed token for ${account.username}, new expiry: ${newExpiryDate}`)
+          } catch (error) {
+            console.error(`Error processing account ${account.username}:`, error)
+          }
+        }
+
+        console.log("Finished refreshing tokens")
+      } catch (error) {
+        console.error("Error refreshing tokens:", error)
+      }
+    },
+    24 * 60 * 60 * 1000,
+  )
 
   console.log("Scheduled jobs initialized")
+}
+
+// Process comments for a post
+async function processPostComments(accessToken, post, automation, instagramAccount) {
+  try {
+    // Validate token before using
+    if (!accessToken || accessToken.includes("undefined") || accessToken.includes("null")) {
+      console.log(`Invalid token format for post ${post.instagramId}, skipping`)
+      return
+    }
+
+    // Get the last check time
+    const lastChecked = automation.lastChecked || new Date(0)
+
+    // Get comments for this post
+    const comments = await getPostComments(accessToken, post.instagramId, lastChecked.toISOString())
+
+    console.log(`Found ${comments.length} comments for post ${post.instagramId}`)
+
+    // Process each comment
+    for (const comment of comments) {
+      try {
+        // Check if we've already processed this comment
+        const existingComment = await db.collection("comments").findOne({ commentId: comment.id })
+
+        if (existingComment && existingComment.processed) {
+          continue
+        }
+
+        // Process the comment
+        await processComment({
+          id: comment.id,
+          text: comment.text || "",
+          media_id: post.instagramId,
+          from: {
+            id: comment.from?.id || "unknown",
+            username: comment.from?.username || comment.username || "unknown",
+          },
+        })
+      } catch (commentError) {
+        console.error(`Error processing comment ${comment.id}:`, commentError)
+      }
+    }
+  } catch (error) {
+    console.error(`Error processing post comments for post ${post.instagramId}:`, error)
+  }
 }
 
 // Start the server
@@ -1886,8 +1424,156 @@ async function startServer() {
     scheduleJobs()
 
     // Run initial jobs
-    setTimeout(checkForComments, 10000) // Run comment check after 10 seconds
-    setTimeout(refreshTokens, 60000) // Run token refresh after 1 minute
+    setTimeout(async () => {
+      try {
+        console.log("Running initial token refresh job")
+        // Get all Instagram accounts
+        const accounts = await db.collection("instagramAccounts").find({}).toArray()
+
+        console.log(`Found ${accounts.length} Instagram accounts`)
+
+        for (const account of accounts) {
+          try {
+            // Skip accounts with invalid token format
+            if (
+              !account.accessToken ||
+              account.accessToken.includes("undefined") ||
+              account.accessToken.includes("null")
+            ) {
+              console.log(`Invalid token format for account ${account.username}, marking for reconnection`)
+
+              // Mark the account as needing reconnection
+              await db.collection("instagramAccounts").updateOne(
+                { _id: account._id },
+                {
+                  $set: {
+                    tokenError: "Invalid token format",
+                    tokenErrorAt: new Date(),
+                    needsReconnection: true,
+                  },
+                },
+              )
+              continue
+            }
+
+            // Validate the token
+            try {
+              const response = await fetch(
+                `https://graph.instagram.com/me?fields=id,username&access_token=${account.accessToken}`,
+                { cache: "no-store" },
+              )
+
+              if (!response.ok) {
+                const errorData = await response.json()
+                console.error(`Token validation failed for ${account.username}:`, errorData)
+
+                // Mark the account as needing reconnection
+                await db.collection("instagramAccounts").updateOne(
+                  { _id: account._id },
+                  {
+                    $set: {
+                      tokenError: "Token validation failed",
+                      tokenErrorAt: new Date(),
+                      needsReconnection: true,
+                    },
+                  },
+                )
+                continue
+              }
+
+              console.log(`Token validated for ${account.username}`)
+            } catch (validationError) {
+              console.error(`Error validating token for ${account.username}:`, validationError)
+
+              // Mark the account as needing reconnection
+              await db.collection("instagramAccounts").updateOne(
+                { _id: account._id },
+                {
+                  $set: {
+                    tokenError: "Token validation error",
+                    tokenErrorAt: new Date(),
+                    needsReconnection: true,
+                  },
+                },
+              )
+              continue
+            }
+
+            // Check if token is expired or will expire soon (within 7 days)
+            const now = new Date()
+            const expiryDate = account.expiresAt ? new Date(account.expiresAt) : null
+            const sevenDaysFromNow = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000)
+
+            // If token doesn't expire or expiry is more than 7 days away, skip
+            if (!expiryDate || expiryDate > sevenDaysFromNow) {
+              continue
+            }
+
+            console.log(`Refreshing token for Instagram account: ${account.username} (expires: ${expiryDate})`)
+
+            // Refresh the long-lived token
+            const response = await fetch(
+              `https://graph.instagram.com/refresh_access_token?grant_type=ig_refresh_token&access_token=${account.accessToken}`,
+              { cache: "no-store" },
+            )
+
+            if (!response.ok) {
+              const errorData = await response.json()
+              console.error(`Failed to refresh token for ${account.username}:`, errorData)
+
+              // Log the error
+              await db.collection("tokenRefreshErrors").insertOne({
+                accountId: account._id,
+                username: account.username,
+                error: errorData,
+                timestamp: new Date(),
+              })
+
+              // Mark the account as needing reconnection
+              await db.collection("instagramAccounts").updateOne(
+                { _id: account._id },
+                {
+                  $set: {
+                    tokenError: "Failed to refresh token automatically",
+                    tokenErrorAt: new Date(),
+                    needsReconnection: true,
+                  },
+                },
+              )
+
+              continue
+            }
+
+            const data = await response.json()
+
+            // Calculate new expiry date
+            const newExpiryDate = new Date()
+            newExpiryDate.setSeconds(newExpiryDate.getSeconds() + data.expires_in)
+
+            // Update the account with new token and expiry
+            await db.collection("instagramAccounts").updateOne(
+              { _id: account._id },
+              {
+                $set: {
+                  accessToken: data.access_token,
+                  expiresAt: newExpiryDate,
+                  lastTokenRefresh: new Date(),
+                  needsReconnection: false,
+                  tokenError: null,
+                  tokenErrorAt: null,
+                },
+              },
+            )
+
+            console.log(`Successfully refreshed token for ${account.username}, new expiry: ${newExpiryDate}`)
+          } catch (error) {
+            console.error(`Error processing account ${account.username}:`, error)
+          }
+        }
+      } catch (error) {
+        console.error("Error in initial token refresh job:", error)
+      }
+    }, 10000)
 
     app.listen(PORT, () => {
       console.log(`Server running on port ${PORT}`)
