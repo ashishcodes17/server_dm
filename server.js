@@ -666,9 +666,39 @@ async function processMessage(messageData) {
     })
 
     // Find the Instagram account by recipient ID
-    const instagramAccount = await db.collection("instagramAccounts").findOne({
+    // First try exact match on instagramId
+    let instagramAccount = await db.collection("instagramAccounts").findOne({
       instagramId: recipient.id,
     })
+
+    // If not found, try to find by pageId
+    if (!instagramAccount) {
+      instagramAccount = await db.collection("instagramAccounts").findOne({
+        pageId: recipient.id,
+      })
+    }
+
+    // If still not found, try to find by any field that might contain the ID
+    if (!instagramAccount) {
+      // Log all accounts for debugging
+      const allAccounts = await db.collection("instagramAccounts").find({}).toArray()
+      console.log(
+        "All Instagram accounts:",
+        JSON.stringify(
+          allAccounts.map((a) => ({
+            _id: a._id,
+            username: a.username,
+            instagramId: a.instagramId,
+            pageId: a.pageId,
+          })),
+        ),
+      )
+
+      // Try to find by any field that might contain the ID
+      instagramAccount = await db.collection("instagramAccounts").findOne({
+        $or: [{ instagramBusinessId: recipient.id }, { businessId: recipient.id }, { igBusinessId: recipient.id }],
+      })
+    }
 
     if (!instagramAccount) {
       console.log(`Instagram account with ID ${recipient.id} not found`)
@@ -1389,12 +1419,13 @@ async function checkForComments() {
       .collection("automations")
       .find({
         active: true,
+        type: "comment", // Only get comment automations
       })
       .toArray()
 
-    console.log(`Found ${automations.length} active automations`)
+    console.log(`Found ${automations.length} active comment automations`)
 
-    const totalProcessed = 0
+    let totalProcessed = 0
     const totalSent = 0
 
     for (const automation of automations) {
@@ -1436,8 +1467,53 @@ async function checkForComments() {
 
           console.log(`Found ${posts.length} posts for account ${instagramAccount._id}`)
 
-          for (const post of posts) {
-            await processPostComments(validToken, post, automation, instagramAccount)
+          // If no posts found, try to fetch them from Instagram
+          if (posts.length === 0) {
+            try {
+              console.log(`Fetching posts for account ${instagramAccount.username}`)
+              const response = await fetch(
+                `https://graph.facebook.com/v18.0/${instagramAccount.instagramId}/media?fields=id,caption,permalink&access_token=${validToken}&limit=10`,
+                { cache: "no-store" },
+              )
+
+              if (response.ok) {
+                const data = await response.json()
+                console.log(`Fetched ${data.data?.length || 0} posts from Instagram API`)
+
+                if (data.data && data.data.length > 0) {
+                  for (const postData of data.data) {
+                    // Create a new post
+                    const newPost = {
+                      _id: new ObjectId().toString(),
+                      instagramAccountId: instagramAccount._id,
+                      instagramId: postData.id,
+                      caption: postData.caption || "",
+                      permalink: postData.permalink || "",
+                      createdAt: new Date(),
+                      updatedAt: new Date(),
+                    }
+
+                    await db.collection("posts").insertOne(newPost)
+                    console.log(`Created new post for media ${postData.id}`)
+
+                    // Process comments for this post
+                    await processPostComments(validToken, newPost, automation, instagramAccount)
+                    totalProcessed++
+                  }
+                }
+              } else {
+                const errorData = await response.json()
+                console.error(`Error fetching posts: ${JSON.stringify(errorData)}`)
+              }
+            } catch (error) {
+              console.error(`Error fetching posts for account ${instagramAccount._id}:`, error)
+            }
+          } else {
+            // Process existing posts
+            for (const post of posts) {
+              await processPostComments(validToken, post, automation, instagramAccount)
+              totalProcessed++
+            }
           }
 
           continue
@@ -1454,6 +1530,7 @@ async function checkForComments() {
         }
 
         await processPostComments(validToken, post, automation, instagramAccount)
+        totalProcessed++
 
         // Update the last checked time
         await db.collection("automations").updateOne({ _id: automation._id }, { $set: { lastChecked: new Date() } })
@@ -1462,7 +1539,7 @@ async function checkForComments() {
       }
     }
 
-    console.log("Finished checking for comments")
+    console.log(`Finished checking for comments. Processed ${totalProcessed} posts, sent ${totalSent} messages.`)
   } catch (error) {
     console.error("Error checking for comments:", error)
   }
@@ -1791,6 +1868,12 @@ function scheduleJobs() {
     }
   }, 60 * 1000)
 
+  // Check for comments every 5 minutes
+  setInterval(checkForComments, 1 * 60 * 1000)
+
+  // Refresh tokens every 24 hours
+  setInterval(refreshTokens, 24 * 60 * 60 * 1000)
+
   console.log("Scheduled jobs initialized")
 }
 
@@ -1801,6 +1884,10 @@ async function startServer() {
 
     // Schedule jobs
     scheduleJobs()
+
+    // Run initial jobs
+    setTimeout(checkForComments, 10000) // Run comment check after 10 seconds
+    setTimeout(refreshTokens, 60000) // Run token refresh after 1 minute
 
     app.listen(PORT, () => {
       console.log(`Server running on port ${PORT}`)
