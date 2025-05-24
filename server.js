@@ -433,13 +433,15 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
 
           try {
             // Use Instagram Graph API to send message with quick replies
-            const response = await fetch(`https://graph.instagram.com/${instagramAccount.instagramId}/messages`, {
+            const response = await fetch(`https://graph.instagram.com/v22.0/${instagramAccount.instagramId}/messages`, {
               method: "POST",
               headers: {
                 "Content-Type": "application/json",
+                Authorization: `Bearer ${validToken}`,
               },
               body: JSON.stringify({
                 recipient: { id: comment.from.id },
+                messaging_type: "RESPONSE",
                 message: {
                   text: openingMessage,
                   quick_replies: [
@@ -450,7 +452,6 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
                     },
                   ],
                 },
-                access_token: validToken,
               }),
             })
 
@@ -752,24 +753,31 @@ async function processMessage(messageData) {
       }
     }
 
-    // Find the Instagram account by recipient ID
+    // Find the Instagram account by recipient ID with better mapping
     let instagramAccount = null
 
-    // First try to find by instagramId
+    // First try to find by instagramId (the actual Instagram business account ID)
     instagramAccount = await db.collection("instagramAccounts").findOne({
       instagramId: recipient.id,
     })
 
-    // If not found, try to find by any account and use as fallback
+    // If not found, try to find by pageId (Facebook Page ID)
+    if (!instagramAccount) {
+      instagramAccount = await db.collection("instagramAccounts").findOne({
+        pageId: recipient.id,
+      })
+    }
+
+    // If still not found, try to find any account and update it with the correct ID
     if (!instagramAccount) {
       const accounts = await db.collection("instagramAccounts").find({}).toArray()
 
       if (accounts.length > 0) {
-        // Use the first account as a fallback
+        // Use the first account and update it with the recipient ID
         instagramAccount = accounts[0]
-        console.log(`Using fallback Instagram account ${instagramAccount.username} for ID ${recipient.id}`)
+        console.log(`Using account ${instagramAccount.username} and updating with recipient ID ${recipient.id}`)
 
-        // Update the account with the recipient ID for future lookups
+        // Update the account with the correct Instagram ID
         await db.collection("instagramAccounts").updateOne(
           { _id: instagramAccount._id },
           {
