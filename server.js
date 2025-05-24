@@ -5,9 +5,6 @@ const { MongoClient, ObjectId } = require("mongodb")
 const cors = require("cors")
 const fetch = require("node-fetch")
 
-// Add this at the top of the file
-const { runMigrations } = require("../lib/migrations")
-
 // Initialize Express app
 const app = express()
 const PORT = process.env.PORT || 3001
@@ -35,10 +32,46 @@ async function connectToMongoDB() {
     await client.connect()
     db = client.db("instaautodm")
     console.log("Connected to MongoDB")
+
+    // Run basic cleanup on startup
+    await runBasicCleanup()
   } catch (error) {
     console.error("Error connecting to MongoDB:", error)
     // Attempt to reconnect after a delay
     setTimeout(connectToMongoDB, 5000)
+  }
+}
+
+// Basic cleanup function (instead of migrations)
+async function runBasicCleanup() {
+  try {
+    console.log("Running basic cleanup...")
+
+    // Clean up old pending messages (older than 24 hours)
+    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000)
+
+    const oldMessages = await db.collection("incomingMessages").updateMany(
+      {
+        processed: false,
+        timestamp: { $lt: oneDayAgo },
+      },
+      {
+        $set: {
+          processed: true,
+          processedAt: new Date(),
+          skipped: true,
+          skipReason: "Too old",
+        },
+      },
+    )
+
+    if (oldMessages.modifiedCount > 0) {
+      console.log(`Cleaned up ${oldMessages.modifiedCount} old pending messages`)
+    }
+
+    console.log("Basic cleanup completed")
+  } catch (error) {
+    console.error("Error in basic cleanup:", error)
   }
 }
 
@@ -130,7 +163,7 @@ async function processComment(comment) {
   try {
     console.log(`Processing comment: ${comment.id} on media ${comment.media_id} from ${comment.from?.username}`)
 
-    // CRITICAL FIX: Skip processing if the comment is from our own automation accounts
+    // Skip processing if the comment is from our own automation accounts
     const automationAccounts = await db.collection("instagramAccounts").find({}).toArray()
     const automationUsernames = automationAccounts.map((acc) => acc.username.toLowerCase())
 
@@ -204,10 +237,10 @@ async function findOrCreatePost(mediaId) {
         }
 
         // Try to fetch the post details using the account's token
-        const token = account.accessToken
+        const token = account.pageAccessToken || account.accessToken
         if (!token) continue
 
-        // Use graph.instagram.com instead of graph.facebook.com as per the documentation
+        // Use graph.instagram.com for Instagram Business accounts
         const response = await fetch(
           `https://graph.instagram.com/${mediaId}?fields=id,permalink,caption&access_token=${token}`,
           { next: { revalidate: 0 } },
@@ -313,7 +346,7 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
 
       console.log(`Trigger "${automation.triggerKeyword}" matched in comment from ${comment.from?.username}`)
 
-      // CRITICAL FIX: Check if we've already sent ANY DM to this user for ANY automation on this comment
+      // Check if we've already sent ANY DM to this user for ANY automation on this comment
       const existingDM = await db.collection("directMessages").findOne({
         recipientUsername: comment.from?.username,
         commentId: comment.id,
@@ -350,7 +383,7 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
       }
 
       // Get a valid token for this account
-      const validToken = instagramAccount.accessToken
+      const validToken = instagramAccount.pageAccessToken || instagramAccount.accessToken
 
       if (!validToken) {
         console.error(`No valid token available for account ${instagramAccount.username}`)
@@ -407,7 +440,6 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
               },
               body: JSON.stringify({
                 recipient: { id: comment.from.id },
-                messaging_type: "RESPONSE",
                 message: {
                   text: openingMessage,
                   quick_replies: [
@@ -446,9 +478,9 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
 
             // Try fallback to regular DM with branding
             try {
-              let fullMessage = openingMessage + "\n\n" + automation.message
+              let fullMessage = openingMessage + "\n\n" + (automation.message || "")
 
-              // CRITICAL FIX: Always add branding
+              // Always add branding
               if (automation.addBranding !== false) {
                 fullMessage += `\n\n${automation.brandingMessage || "⚡ Sent via ChatAutoDM — grow your DMs on autopilot"}`
               }
@@ -493,7 +525,7 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
           // Send direct message with branding
           let fullMessage = automation.message || "Thank you for your comment!"
 
-          // CRITICAL FIX: Always add branding
+          // Always add branding
           if (automation.addBranding !== false) {
             fullMessage += `\n\n${automation.brandingMessage || "⚡ Sent via ChatAutoDM — grow your DMs on autopilot"}`
           }
@@ -548,7 +580,7 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
           `Sent message to ${comment.from?.username} via ${messageResult.method} for automation ${automation._id}`,
         )
 
-        // CRITICAL FIX: Break after sending one message to prevent duplicates
+        // Break after sending one message to prevent duplicates
         break
       } catch (error) {
         console.error(`Error sending message to ${comment.from?.username}:`, error)
@@ -624,7 +656,7 @@ async function processButtonClick(data) {
     // Send the main content message with branding
     let fullMessage = automation.message || "Thank you for your interest!"
 
-    // CRITICAL FIX: Always add branding
+    // Always add branding
     if (automation.addBranding !== false) {
       fullMessage += `\n\n${automation.brandingMessage || "⚡ Sent via ChatAutoDM — grow your DMs on autopilot"}`
     }
@@ -632,7 +664,7 @@ async function processButtonClick(data) {
     // Get username from ID
     let username = "user"
     try {
-      const token = instagramAccount.accessToken
+      const token = instagramAccount.pageAccessToken || instagramAccount.accessToken
       const userResponse = await fetch(
         `https://graph.instagram.com/${senderId}?fields=username&access_token=${token}`,
         { cache: "no-store" },
@@ -654,7 +686,7 @@ async function processButtonClick(data) {
       body: JSON.stringify({
         recipient: { id: senderId },
         message: { text: fullMessage },
-        access_token: instagramAccount.accessToken,
+        access_token: instagramAccount.pageAccessToken || instagramAccount.accessToken,
       }),
     })
 
@@ -710,7 +742,7 @@ async function processMessage(messageData) {
       messageData,
     })
 
-    // CRITICAL FIX: Skip echo messages (messages sent by our automation)
+    // Skip echo messages (messages sent by our automation)
     if (messageData.message?.is_echo) {
       console.log("Skipping echo message (sent by automation)")
       return {
@@ -720,7 +752,7 @@ async function processMessage(messageData) {
       }
     }
 
-    // Find the Instagram account by recipient ID using our new function
+    // Find the Instagram account by recipient ID
     let instagramAccount = null
 
     // First try to find by instagramId
@@ -728,27 +760,7 @@ async function processMessage(messageData) {
       instagramId: recipient.id,
     })
 
-    // If not found, try to find by recipientId (for backwards compatibility)
-    if (!instagramAccount) {
-      instagramAccount = await db.collection("instagramAccounts").findOne({
-        recipientId: recipient.id,
-      })
-
-      // If found, update the account with the Instagram ID for future lookups
-      if (instagramAccount) {
-        await db.collection("instagramAccounts").updateOne(
-          { _id: instagramAccount._id },
-          {
-            $set: {
-              instagramId: recipient.id,
-              updatedAt: new Date(),
-            },
-          },
-        )
-      }
-    }
-
-    // If still not found, check if we have any accounts at all
+    // If not found, try to find by any account and use as fallback
     if (!instagramAccount) {
       const accounts = await db.collection("instagramAccounts").find({}).toArray()
 
@@ -757,17 +769,15 @@ async function processMessage(messageData) {
         instagramAccount = accounts[0]
         console.log(`Using fallback Instagram account ${instagramAccount.username} for ID ${recipient.id}`)
 
-        // Store this mapping for future use
-        await db.collection("instagramIdMappings").updateOne(
-          { instagramId: recipient.id },
+        // Update the account with the recipient ID for future lookups
+        await db.collection("instagramAccounts").updateOne(
+          { _id: instagramAccount._id },
           {
             $set: {
-              accountId: instagramAccount._id,
-              createdAt: new Date(),
+              instagramId: recipient.id,
               updatedAt: new Date(),
             },
           },
-          { upsert: true },
         )
       }
     }
@@ -786,7 +796,6 @@ async function processMessage(messageData) {
     const existingMessage = await db.collection("incomingMessages").findOne({
       senderId: sender.id,
       message: message?.text || "",
-      timestamp: new Date(timestamp || Date.now()),
       processed: true,
     })
 
@@ -821,7 +830,7 @@ async function processMessage(messageData) {
       // Try to get username from Instagram Graph API
       let username = sender.username || "unknown"
       try {
-        const token = instagramAccount.accessToken
+        const token = instagramAccount.pageAccessToken || instagramAccount.accessToken
         if (token && !token.includes("undefined") && !token.includes("null")) {
           const userResponse = await fetch(
             `https://graph.instagram.com/${sender.id}?fields=username&access_token=${token}`,
@@ -909,7 +918,7 @@ async function processMessage(messageData) {
         if (triggerMatched) {
           console.log(`Trigger "${automation.triggerKeyword}" matched in message from ${sender.id}`)
 
-          // CRITICAL FIX: Check if we've already sent a response to this user for this automation
+          // Check if we've already sent a response to this user for this automation recently
           const existingResponse = await db.collection("directMessages").findOne({
             automationId: automation._id,
             recipientId: sender.id,
@@ -950,7 +959,7 @@ async function processMessage(messageData) {
           // Send the automated response with retry logic
           let responseMessage = automation.message || "Thank you for your message!"
 
-          // CRITICAL FIX: Always add branding
+          // Always add branding
           if (automation.addBranding !== false) {
             responseMessage += `\n\n${automation.brandingMessage || "⚡ Sent via ChatAutoDM — grow your DMs on autopilot"}`
           }
@@ -962,7 +971,7 @@ async function processMessage(messageData) {
           for (let attempt = 1; attempt <= 3; attempt++) {
             try {
               // Send the DM directly using the Instagram Graph API
-              const token = instagramAccount.accessToken
+              const token = instagramAccount.pageAccessToken || instagramAccount.accessToken
               const dmResponse = await fetch(`https://graph.instagram.com/${instagramAccount.instagramId}/messages`, {
                 method: "POST",
                 headers: {
@@ -1060,10 +1069,7 @@ async function processMessage(messageData) {
     // Mark the message as processed
     await db
       .collection("incomingMessages")
-      .updateMany(
-        { senderId: sender.id, recipientId: recipient.id, processed: false },
-        { $set: { processed: true, processedAt: new Date() } },
-      )
+      .updateMany({ senderId: sender.id, processed: false }, { $set: { processed: true, processedAt: new Date() } })
 
     return {
       success: true,
@@ -1089,7 +1095,7 @@ async function replyToComment(accessToken, commentId, replyText) {
       throw new Error("Invalid access token format")
     }
 
-    // Use graph.instagram.com instead of graph.facebook.com
+    // Use graph.instagram.com for Instagram Business accounts
     const response = await fetch(
       `https://graph.instagram.com/${commentId}/replies?message=${encodeURIComponent(replyText)}&access_token=${accessToken}`,
       {
@@ -1112,73 +1118,6 @@ async function replyToComment(accessToken, commentId, replyText) {
   }
 }
 
-// Send a private reply to a comment
-async function sendPrivateReply(accessToken, instagramId, commentId, message) {
-  try {
-    // Validate token
-    if (!accessToken || accessToken.includes("undefined") || accessToken.includes("null")) {
-      throw new Error("Invalid access token format")
-    }
-
-    // Use graph.instagram.com as per the documentation
-    const response = await fetch(`https://graph.instagram.com/${instagramId}/messages`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        recipient: { comment_id: commentId },
-        message: { text: message },
-        access_token: accessToken,
-      }),
-    })
-
-    if (!response.ok) {
-      const errorData = await response.json()
-      throw new Error(`Failed to send private reply: ${JSON.stringify(errorData)}`)
-    }
-
-    return await response.json()
-  } catch (error) {
-    console.error("Error sending private reply:", error)
-    throw error
-  }
-}
-
-// Get comments for a post
-async function getPostComments(accessToken, postId, since) {
-  try {
-    // Validate token before using
-    if (!accessToken || accessToken.includes("undefined") || accessToken.includes("null")) {
-      throw new Error("Invalid access token format")
-    }
-
-    // Use graph.instagram.com as per the documentation
-    const url = `https://graph.instagram.com/${postId}/comments?fields=id,text,username,timestamp,from&access_token=${accessToken}&limit=50${since ? `&since=${since}` : ""}`
-
-    const response = await fetch(url, { cache: "no-store" })
-
-    if (!response.ok) {
-      const errorData = await response.json()
-      console.error("Instagram API error:", errorData)
-      throw new Error(`Failed to fetch post comments: ${JSON.stringify(errorData)}`)
-    }
-
-    const data = await response.json()
-
-    return data.data.map((comment) => ({
-      id: comment.id,
-      text: comment.text || "",
-      username: comment.username || comment.from?.username || "unknown",
-      timestamp: comment.timestamp,
-      from: comment.from || { id: "unknown", username: comment.username || "unknown" },
-    }))
-  } catch (error) {
-    console.error("Error fetching post comments:", error)
-    return []
-  }
-}
-
 // Schedule jobs
 function scheduleJobs() {
   // Check for pending messages every minute
@@ -1187,13 +1126,13 @@ function scheduleJobs() {
       const pendingMessages = await db
         .collection("incomingMessages")
         .find({ processed: false })
-        .sort({ createdAt: 1 })
+        .sort({ timestamp: 1 })
         .limit(20)
         .toArray()
 
       console.log(`Processing ${pendingMessages.length} pending messages`)
 
-      // CRITICAL FIX: Skip messages that are too old (more than 24 hours)
+      // Skip messages that are too old (more than 24 hours)
       const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000)
       const recentMessages = pendingMessages.filter((msg) => !msg.timestamp || new Date(msg.timestamp) > oneDayAgo)
 
@@ -1272,59 +1211,10 @@ function scheduleJobs() {
   console.log("Scheduled jobs initialized")
 }
 
-// Process comments for a post
-async function processPostComments(accessToken, post, automation, instagramAccount) {
-  try {
-    // Validate token before using
-    if (!accessToken || accessToken.includes("undefined") || accessToken.includes("null")) {
-      console.log(`Invalid token format for post ${post.instagramId}, skipping`)
-      return
-    }
-
-    // Get the last check time
-    const lastChecked = automation.lastChecked || new Date(0)
-
-    // Get comments for this post
-    const comments = await getPostComments(accessToken, post.instagramId, lastChecked.toISOString())
-
-    console.log(`Found ${comments.length} comments for post ${post.instagramId}`)
-
-    // Process each comment
-    for (const comment of comments) {
-      try {
-        // Check if we've already processed this comment
-        const existingComment = await db.collection("comments").findOne({ commentId: comment.id })
-
-        if (existingComment && existingComment.processed) {
-          continue
-        }
-
-        // Process the comment
-        await processComment({
-          id: comment.id,
-          text: comment.text || "",
-          media_id: post.instagramId,
-          from: {
-            id: comment.from?.id || "unknown",
-            username: comment.from?.username || comment.username || "unknown",
-          },
-        })
-      } catch (commentError) {
-        console.error(`Error processing comment ${comment.id}:`, commentError)
-      }
-    }
-  } catch (error) {
-    console.error(`Error processing post comments for post ${post.instagramId}:`, error)
-  }
-}
-
-// Update the startServer function
+// Start the server
 async function startServer() {
   try {
     await connectToMongoDB()
-
-    // Run migrations
-    await runMigrations()
 
     // Schedule jobs
     scheduleJobs()
