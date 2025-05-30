@@ -18,6 +18,10 @@ const MONGODB_URI = process.env.MONGODB_URI
 let client
 let db
 
+// Keep-alive mechanism
+let keepAliveInterval
+let healthCheckInterval
+
 // Connect to MongoDB with improved options
 async function connectToMongoDB() {
   try {
@@ -144,8 +148,125 @@ app.get("/", (req, res) => {
 
 // Health check endpoint
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", timestamp: new Date() })
+  res.json({
+    status: "ok",
+    timestamp: new Date(),
+    uptime: process.uptime(),
+    memory: process.memoryUsage(),
+  })
 })
+
+// Enhanced keep alive endpoint
+app.get("/keep-alive", async (req, res) => {
+  try {
+    console.log("Keep alive ping received at", new Date().toISOString())
+
+    // Perform some database activity to keep connections alive
+    await db.collection("serverStatus").updateOne(
+      { _id: "keep-alive" },
+      {
+        $set: {
+          lastPing: new Date(),
+          status: "alive",
+          uptime: process.uptime(),
+          memory: process.memoryUsage(),
+        },
+      },
+      { upsert: true },
+    )
+
+    // Process any pending messages while we're at it
+    const pendingCount = await processPendingMessages()
+    const pendingComments = await processPendingComments()
+
+    res.json({
+      status: "alive",
+      timestamp: new Date(),
+      uptime: process.uptime(),
+      memory: process.memoryUsage(),
+      pendingMessages: pendingCount,
+      pendingComments: pendingComments,
+    })
+  } catch (error) {
+    console.error("Error in keep-alive:", error)
+    res.status(500).json({ error: "Keep alive failed" })
+  }
+})
+
+// Process pending messages
+async function processPendingMessages() {
+  try {
+    const pendingMessages = await db
+      .collection("incomingMessages")
+      .find({ processed: false })
+      .sort({ timestamp: 1 })
+      .limit(50)
+      .toArray()
+
+    if (pendingMessages.length > 0) {
+      console.log(`Processing ${pendingMessages.length} pending messages`)
+    }
+
+    for (const message of pendingMessages) {
+      try {
+        await processMessage({
+          sender: { id: message.senderId, username: message.senderUsername },
+          recipient: { id: message.recipientId || "unknown" },
+          message: { text: message.message },
+          timestamp: message.timestamp,
+        })
+      } catch (error) {
+        console.error(`Error processing pending message ${message._id}:`, error)
+      }
+    }
+
+    return pendingMessages.length
+  } catch (error) {
+    console.error("Error processing pending messages:", error)
+    return 0
+  }
+}
+
+// Process pending comments
+async function processPendingComments() {
+  try {
+    const pendingComments = await db
+      .collection("pendingComments")
+      .find({ processed: false })
+      .sort({ createdAt: 1 })
+      .limit(50)
+      .toArray()
+
+    if (pendingComments.length > 0) {
+      console.log(`Processing ${pendingComments.length} pending comments`)
+    }
+
+    for (const comment of pendingComments) {
+      try {
+        await processComment({
+          id: comment.commentId,
+          text: comment.text,
+          media_id: comment.mediaId,
+          from: {
+            id: comment.userId,
+            username: comment.username,
+          },
+        })
+
+        await db
+          .collection("pendingComments")
+          .updateOne({ _id: comment._id }, { $set: { processed: true, processedAt: new Date() } })
+      } catch (error) {
+        console.error(`Error processing pending comment ${comment._id}:`, error)
+      }
+    }
+
+    return pendingComments.length
+  } catch (error) {
+    console.error("Error processing pending comments:", error)
+    return 0
+  }
+}
 
 // Process events from the main app
 app.post("/api/process-event", authenticateRequest, async (req, res) => {
@@ -399,141 +520,43 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
       try {
         let messageResult
 
-        if (automation.useOpeningMessage) {
-          const openingMessage =
-            automation.openingMessage ||
-            "Hey there! I'm so happy you're here, thanks so much for your interest 😊\n\nClick below and I'll send you the link in just a sec ✨"
+        // Send direct message
+        let fullMessage = automation.message || "Thank you for your comment!"
 
-          const buttonText = automation.buttonText || "Send me the link"
-
-          try {
-            // Send message with quick replies using Instagram Messaging API
-            const response = await fetch(`https://graph.instagram.com/v18.0/${instagramAccount.instagramId}/messages`, {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                Authorization: `Bearer ${validToken}`,
-              },
-              body: JSON.stringify({
-                recipient: { id: comment.from.id },
-                message: {
-                  text: openingMessage,
-                  quick_replies: [
-                    {
-                      content_type: "text",
-                      title: buttonText,
-                      payload: `SEND_CONTENT_${automation._id}`,
-                    },
-                  ],
-                },
-              }),
-            })
-
-            if (!response.ok) {
-              const errorData = await response.json()
-              throw new Error(`Failed to send message with quick replies: ${JSON.stringify(errorData)}`)
-            }
-
-            await db.collection("directMessages").insertOne({
-              _id: new ObjectId().toString(),
-              automationId: automation._id,
-              recipientUsername: comment.from?.username || "unknown",
-              recipientId: comment.from.id,
-              commentId: comment.id,
-              message: openingMessage,
-              type: "opening",
-              status: "sent",
-              sentAt: new Date(),
-            })
-
-            messageResult = { success: true, method: "quick_replies" }
-          } catch (buttonError) {
-            console.error(`Error sending DM with quick replies to ${comment.from?.username}:`, buttonError)
-
-            // Fallback to regular DM
-            try {
-              let fullMessage = openingMessage + "\n\n" + (automation.message || "")
-
-              if (automation.addBranding !== false) {
-                fullMessage += `\n\n${automation.brandingMessage || "⚡ Sent via ChatAutoDM — grow your DMs on autopilot"}`
-              }
-
-              const response = await fetch(
-                `https://graph.instagram.com/v18.0/${instagramAccount.instagramId}/messages`,
-                {
-                  method: "POST",
-                  headers: {
-                    "Content-Type": "application/json",
-                    Authorization: `Bearer ${validToken}`,
-                  },
-                  body: JSON.stringify({
-                    recipient: { id: comment.from.id },
-                    message: { text: fullMessage },
-                  }),
-                },
-              )
-
-              if (!response.ok) {
-                const errorData = await response.json()
-                throw new Error(`Failed to send fallback message: ${JSON.stringify(errorData)}`)
-              }
-
-              await db.collection("directMessages").insertOne({
-                _id: new ObjectId().toString(),
-                automationId: automation._id,
-                recipientUsername: comment.from?.username || "unknown",
-                recipientId: comment.from.id,
-                commentId: comment.id,
-                message: fullMessage,
-                type: "direct",
-                status: "sent",
-                sentAt: new Date(),
-              })
-
-              messageResult = { success: true, method: "direct_message" }
-            } catch (fallbackError) {
-              throw fallbackError
-            }
-          }
-        } else {
-          // Send direct message
-          let fullMessage = automation.message || "Thank you for your comment!"
-
-          if (automation.addBranding !== false) {
-            fullMessage += `\n\n${automation.brandingMessage || "⚡ Sent via ChatAutoDM — grow your DMs on autopilot"}`
-          }
-
-          const response = await fetch(`https://graph.instagram.com/v18.0/${instagramAccount.instagramId}/messages`, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${validToken}`,
-            },
-            body: JSON.stringify({
-              recipient: { id: comment.from.id },
-              message: { text: fullMessage },
-            }),
-          })
-
-          if (!response.ok) {
-            const errorData = await response.json()
-            throw new Error(`Failed to send direct message: ${JSON.stringify(errorData)}`)
-          }
-
-          await db.collection("directMessages").insertOne({
-            _id: new ObjectId().toString(),
-            automationId: automation._id,
-            recipientUsername: comment.from?.username || "unknown",
-            recipientId: comment.from.id,
-            commentId: comment.id,
-            message: fullMessage,
-            type: "direct",
-            status: "sent",
-            sentAt: new Date(),
-          })
-
-          messageResult = { success: true, method: "direct_message" }
+        if (automation.addBranding !== false) {
+          fullMessage += `\n\n${automation.brandingMessage || "⚡ Sent via ChatAutoDM — grow your DMs on autopilot"}`
         }
+
+        const response = await fetch(`https://graph.instagram.com/v18.0/${instagramAccount.instagramId}/messages`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${validToken}`,
+          },
+          body: JSON.stringify({
+            recipient: { id: comment.from.id },
+            message: { text: fullMessage },
+          }),
+        })
+
+        if (!response.ok) {
+          const errorData = await response.json()
+          throw new Error(`Failed to send direct message: ${JSON.stringify(errorData)}`)
+        }
+
+        await db.collection("directMessages").insertOne({
+          _id: new ObjectId().toString(),
+          automationId: automation._id,
+          recipientUsername: comment.from?.username || "unknown",
+          recipientId: comment.from.id,
+          commentId: comment.id,
+          message: fullMessage,
+          type: "direct",
+          status: "sent",
+          sentAt: new Date(),
+        })
+
+        messageResult = { success: true, method: "direct_message" }
 
         messagesSent++
         automationProcessed = true
@@ -561,7 +584,7 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
           recipientUsername: comment.from?.username || "unknown",
           recipientId: comment.from.id,
           commentId: comment.id,
-          message: automation.useOpeningMessage ? automation.openingMessage : automation.message,
+          message: automation.message,
           status: "failed",
           error: String(error),
           sentAt: new Date(),
@@ -586,108 +609,6 @@ async function processCommentWithAutomations(comment, post, instagramAccount) {
       success: false,
       message: `Error: ${error.message}`,
       processed: false,
-    }
-  }
-}
-
-// Process a button click (quick reply)
-async function processButtonClick(data) {
-  try {
-    const { automationId, senderId, recipientId } = data
-
-    console.log(`Processing button click: automation=${automationId}, sender=${senderId}`)
-
-    const automation = await db.collection("automations").findOne({ _id: automationId })
-
-    if (!automation) {
-      throw new Error(`Automation ${automationId} not found`)
-    }
-
-    const instagramAccount = await db.collection("instagramAccounts").findOne({
-      _id: automation.instagramAccountId,
-    })
-
-    if (!instagramAccount) {
-      throw new Error(`Instagram account ${automation.instagramAccountId} not found`)
-    }
-
-    if (
-      !instagramAccount.accessToken ||
-      instagramAccount.accessToken.includes("undefined") ||
-      instagramAccount.accessToken.includes("null")
-    ) {
-      throw new Error(`Invalid token format for account ${instagramAccount.username}`)
-    }
-
-    let fullMessage = automation.message || "Thank you for your interest!"
-
-    if (automation.addBranding !== false) {
-      fullMessage += `\n\n${automation.brandingMessage || "⚡ Sent via ChatAutoDM — grow your DMs on autopilot"}`
-    }
-
-    let username = "user"
-    try {
-      const token = instagramAccount.pageAccessToken || instagramAccount.accessToken
-      const userResponse = await fetch(
-        `https://graph.instagram.com/v18.0/${senderId}?fields=username&access_token=${token}`,
-        { cache: "no-store" },
-      )
-      if (userResponse.ok) {
-        const userData = await userResponse.json()
-        username = userData.username || username
-      }
-    } catch (error) {
-      console.error("Error getting username:", error)
-    }
-
-    const dmResponse = await fetch(`https://graph.instagram.com/v18.0/${instagramAccount.instagramId}/messages`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${instagramAccount.pageAccessToken || instagramAccount.accessToken}`,
-      },
-      body: JSON.stringify({
-        recipient: { id: senderId },
-        message: { text: fullMessage },
-      }),
-    })
-
-    if (!dmResponse.ok) {
-      const errorData = await dmResponse.json()
-      throw new Error(`Failed to send direct message: ${JSON.stringify(errorData)}`)
-    }
-
-    await db.collection("directMessages").insertOne({
-      _id: new ObjectId().toString(),
-      automationId: automation._id,
-      userId: instagramAccount.userId,
-      instagramAccountId: instagramAccount._id,
-      recipientUsername: username,
-      recipientId: senderId,
-      message: fullMessage,
-      status: "sent",
-      sentAt: new Date(),
-    })
-
-    await db.collection("automations").updateOne(
-      { _id: automation._id },
-      {
-        $inc: { totalDMsSent: 1 },
-        $set: { lastTriggered: new Date() },
-      },
-    )
-
-    console.log(`Sent content DM to ${username} for automation ${automation._id}`)
-
-    return {
-      success: true,
-      message: `Sent content DM to ${username} for automation ${automation._id}`,
-    }
-  } catch (error) {
-    console.error("Error processing button click:", error)
-    return {
-      success: false,
-      message: `Error: ${error.message}`,
     }
   }
 }
@@ -1005,6 +926,108 @@ async function processMessage(messageData) {
   }
 }
 
+// Process a button click (postback)
+async function processButtonClick(data) {
+  try {
+    const { automationId, senderId, recipientId } = data
+
+    console.log(`Processing button click: automation=${automationId}, sender=${senderId}`)
+
+    const automation = await db.collection("automations").findOne({ _id: automationId })
+
+    if (!automation) {
+      throw new Error(`Automation ${automationId} not found`)
+    }
+
+    const instagramAccount = await db.collection("instagramAccounts").findOne({
+      _id: automation.instagramAccountId,
+    })
+
+    if (!instagramAccount) {
+      throw new Error(`Instagram account ${automation.instagramAccountId} not found`)
+    }
+
+    if (
+      !instagramAccount.accessToken ||
+      instagramAccount.accessToken.includes("undefined") ||
+      instagramAccount.accessToken.includes("null")
+    ) {
+      throw new Error(`Invalid token format for account ${instagramAccount.username}`)
+    }
+
+    let fullMessage = automation.message || "Thank you for your interest!"
+
+    if (automation.addBranding !== false) {
+      fullMessage += `\n\n${automation.brandingMessage || "⚡ Sent via ChatAutoDM — grow your DMs on autopilot"}`
+    }
+
+    let username = "user"
+    try {
+      const token = instagramAccount.pageAccessToken || instagramAccount.accessToken
+      const userResponse = await fetch(
+        `https://graph.instagram.com/v18.0/${senderId}?fields=username&access_token=${token}`,
+        { cache: "no-store" },
+      )
+      if (userResponse.ok) {
+        const userData = await userResponse.json()
+        username = userData.username || username
+      }
+    } catch (error) {
+      console.error("Error getting username:", error)
+    }
+
+    const dmResponse = await fetch(`https://graph.instagram.com/v18.0/${instagramAccount.instagramId}/messages`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${instagramAccount.pageAccessToken || instagramAccount.accessToken}`,
+      },
+      body: JSON.stringify({
+        recipient: { id: senderId },
+        message: { text: fullMessage },
+      }),
+    })
+
+    if (!dmResponse.ok) {
+      const errorData = await dmResponse.json()
+      throw new Error(`Failed to send direct message: ${JSON.stringify(errorData)}`)
+    }
+
+    await db.collection("directMessages").insertOne({
+      _id: new ObjectId().toString(),
+      automationId: automation._id,
+      userId: instagramAccount.userId,
+      instagramAccountId: instagramAccount._id,
+      recipientUsername: username,
+      recipientId: senderId,
+      message: fullMessage,
+      status: "sent",
+      sentAt: new Date(),
+    })
+
+    await db.collection("automations").updateOne(
+      { _id: automation._id },
+      {
+        $inc: { totalDMsSent: 1 },
+        $set: { lastTriggered: new Date() },
+      },
+    )
+
+    console.log(`Sent content DM to ${username} for automation ${automation._id}`)
+
+    return {
+      success: true,
+      message: `Sent content DM to ${username} for automation ${automation._id}`,
+    }
+  } catch (error) {
+    console.error("Error processing button click:", error)
+    return {
+      success: false,
+      message: `Error: ${error.message}`,
+    }
+  }
+}
+
 // Find or create a post
 async function findOrCreatePost(mediaId) {
   try {
@@ -1090,97 +1113,25 @@ async function replyToComment(accessToken, commentId, replyText) {
   }
 }
 
-// Enhanced scheduled jobs for 24/7 operation
-function scheduleJobs() {
-  // Process pending messages every 30 seconds for faster response
-  setInterval(async () => {
+// Self-ping mechanism to prevent sleeping
+function startKeepAlive() {
+  const serverUrl = process.env.RENDER_SERVER_URL || "https://server-dm-5909.onrender.com"
+
+  // Self-ping every 25 seconds
+  keepAliveInterval = setInterval(async () => {
     try {
-      const pendingMessages = await db
-        .collection("incomingMessages")
-        .find({ processed: false })
-        .sort({ timestamp: 1 })
-        .limit(50) // Increased limit
-        .toArray()
-
-      if (pendingMessages.length > 0) {
-        console.log(`Processing ${pendingMessages.length} pending messages`)
-      }
-
-      const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000)
-      const recentMessages = pendingMessages.filter((msg) => !msg.timestamp || new Date(msg.timestamp) > oneDayAgo)
-
-      if (recentMessages.length < pendingMessages.length) {
-        const oldMessageIds = pendingMessages
-          .filter((msg) => msg.timestamp && new Date(msg.timestamp) <= oneDayAgo)
-          .map((msg) => msg._id)
-
-        if (oldMessageIds.length > 0) {
-          await db
-            .collection("incomingMessages")
-            .updateMany(
-              { _id: { $in: oldMessageIds } },
-              { $set: { processed: true, processedAt: new Date(), skipped: true, skipReason: "Too old" } },
-            )
-        }
-      }
-
-      for (const message of recentMessages) {
-        try {
-          await processMessage({
-            sender: { id: message.senderId, username: message.senderUsername },
-            recipient: { id: message.recipientId || "unknown" },
-            message: { text: message.message },
-            timestamp: message.timestamp,
-          })
-        } catch (error) {
-          console.error(`Error processing pending message ${message._id}:`, error)
-        }
+      const response = await fetch(`${serverUrl}/keep-alive`)
+      if (response.ok) {
+        const data = await response.json()
+        console.log(`Self-ping successful - Uptime: ${Math.floor(data.uptime)}s`)
       }
     } catch (error) {
-      console.error("Error in pending messages job:", error)
+      console.error("Self-ping failed:", error)
     }
-  }, 30 * 1000) // Every 30 seconds
+  }, 25000) // 25 seconds
 
-  // Process pending comments every 30 seconds
-  setInterval(async () => {
-    try {
-      const pendingComments = await db
-        .collection("pendingComments")
-        .find({ processed: false })
-        .sort({ createdAt: 1 })
-        .limit(50)
-        .toArray()
-
-      if (pendingComments.length > 0) {
-        console.log(`Processing ${pendingComments.length} pending comments`)
-      }
-
-      for (const comment of pendingComments) {
-        try {
-          await processComment({
-            id: comment.commentId,
-            text: comment.text,
-            media_id: comment.mediaId,
-            from: {
-              id: comment.userId,
-              username: comment.username,
-            },
-          })
-
-          await db
-            .collection("pendingComments")
-            .updateOne({ _id: comment._id }, { $set: { processed: true, processedAt: new Date() } })
-        } catch (error) {
-          console.error(`Error processing pending comment ${comment._id}:`, error)
-        }
-      }
-    } catch (error) {
-      console.error("Error in pending comments job:", error)
-    }
-  }, 30 * 1000) // Every 30 seconds
-
-  // Health check and cleanup every 5 minutes
-  setInterval(
+  // Health check every 2 minutes
+  healthCheckInterval = setInterval(
     async () => {
       try {
         // Fix any Instagram account IDs that are still "unknown"
@@ -1192,25 +1143,42 @@ function scheduleJobs() {
           timestamp: { $lt: oneWeekAgo },
         })
 
-        console.log("Health check and cleanup completed")
+        // Update server status
+        await db.collection("serverStatus").updateOne(
+          { _id: "health-check" },
+          {
+            $set: {
+              lastHealthCheck: new Date(),
+              status: "healthy",
+              uptime: process.uptime(),
+            },
+          },
+          { upsert: true },
+        )
+
+        console.log("Health check completed")
       } catch (error) {
         console.error("Error in health check:", error)
       }
     },
-    5 * 60 * 1000,
-  ) // Every 5 minutes
+    2 * 60 * 1000,
+  ) // 2 minutes
 
-  console.log("Enhanced scheduled jobs initialized for 24/7 operation")
+  console.log("Keep-alive mechanism started")
 }
 
 // Start the server
 async function startServer() {
   try {
     await connectToMongoDB()
-    scheduleJobs()
 
     app.listen(PORT, () => {
       console.log(`Server running on port ${PORT}`)
+
+      // Start keep-alive mechanism after 10 seconds
+      setTimeout(() => {
+        startKeepAlive()
+      }, 10000)
     })
   } catch (error) {
     console.error("Error starting server:", error)
@@ -1221,6 +1189,11 @@ async function startServer() {
 // Handle graceful shutdown
 process.on("SIGTERM", async () => {
   console.log("SIGTERM received, shutting down gracefully")
+
+  // Clear intervals
+  if (keepAliveInterval) clearInterval(keepAliveInterval)
+  if (healthCheckInterval) clearInterval(healthCheckInterval)
+
   if (client) {
     await client.close()
     console.log("MongoDB connection closed")
